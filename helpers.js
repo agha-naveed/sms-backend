@@ -22,7 +22,7 @@ cloudinary.config({
 });
 
 const ALLOWED = [".jpg", ".jpeg", ".png", ".pdf", ".doc", ".docx"];
-const IMAGE_LIKE = [".jpg", ".jpeg", ".png", ".pdf"];
+const IMAGE_LIKE = [".jpg", ".jpeg", ".png"];
 const CLOUDINARY_FOLDER = process.env.CLOUDINARY_FOLDER || "sms";
 
 const memoryUpload = multer({
@@ -48,8 +48,9 @@ function sendToCloudinary(file) {
     const stream = cloudinary.uploader.upload_stream(
       {
         folder: CLOUDINARY_FOLDER,
-        // Images and PDFs are stored as "image" and Word files as "raw".
-        // Raw files need the extension kept in their name to open properly.
+        // Photos are stored as "image"; PDFs and Word files as "raw" so they are
+        // delivered exactly as uploaded. Raw files keep their extension in the
+        // name so the link ends in .pdf / .docx and opens properly.
         resource_type: isImageLike ? "image" : "raw",
         public_id: isImageLike ? stamp : stamp + ext,
         use_filename: false,
