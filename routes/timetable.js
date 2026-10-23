@@ -1,0 +1,421 @@
+// A weekly grid per class + section, built from a shared list of periods.
+// The admin can see and edit any class's grid at any time. Everyone else
+// (teacher, student, parent) only ever sees it once the admin publishes
+// that section, and only the part that is theirs:
+//   - a student/parent sees their own class + section's grid
+//   - a teacher sees a personal weekly grid assembled from every slot
+//     where they are the teacher, across every published section
+//
+// The one rule that must never be broken: a teacher cannot be in two
+// places in the same period on the same day. That is checked here before
+// saving, AND enforced by a database constraint as a second safety net -
+// so this can never silently happen even if two admins save at once.
+const express = require("express");
+const { query, queryOne } = require("../db");
+const {
+  requireLogin, allow, teacherOwnsSection, parentOwnsStudent, getStudentOfUser, getTeacherOfUser,
+} = require("../auth");
+const { DAY_NAMES, WEEKLY_HOLIDAY, logAudit } = require("../helpers");
+
+const router = express.Router();
+router.use(requireLogin);
+
+// Monday first, the weekly holiday left out, matching how people actually
+// think about a school week.
+function schoolDays() {
+  const order = [1, 2, 3, 4, 5, 6, 0];
+  return order.filter(function (d) { return d !== WEEKLY_HOLIDAY; });
+}
+
+// ------------------------------------------------------------------
+// PERIODS  (shared by the whole school)
+// ------------------------------------------------------------------
+router.get("/periods", async function (req, res) {
+  try {
+    const rows = await query("SELECT * FROM periods ORDER BY start_time");
+    res.json(rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Could not load periods." });
+  }
+});
+
+router.post("/periods", allow("admin"), async function (req, res) {
+  try {
+    const { label, start_time, end_time } = req.body;
+    if (!label || !start_time || !end_time) {
+      return res.status(400).json({ message: "Fill in the label, start time and end time." });
+    }
+    if (start_time >= end_time) {
+      return res.status(400).json({ message: "The start time must be before the end time." });
+    }
+
+    const row = await queryOne(
+      "INSERT INTO periods (label, start_time, end_time) VALUES ($1,$2,$3) RETURNING *",
+      [label, start_time, end_time]
+    );
+
+    logAudit(req.user, "created", "period", label + " (" + start_time + "-" + end_time + ")");
+    res.status(201).json(row);
+  } catch (err) {
+    if (err.code === "23505") {
+      return res.status(400).json({ message: "A period already starts at that time." });
+    }
+    console.error(err);
+    res.status(500).json({ message: "Could not add the period." });
+  }
+});
+
+router.delete("/periods/:id", allow("admin"), async function (req, res) {
+  try {
+    const used = await queryOne("SELECT id FROM timetable_slots WHERE period_id = $1 LIMIT 1", [req.params.id]);
+    if (used) {
+      return res.status(400).json({
+        message: "This period is used in a class timetable. Clear those slots first, then delete it.",
+      });
+    }
+
+    const row = await queryOne("DELETE FROM periods WHERE id = $1 RETURNING label", [req.params.id]);
+    if (row) logAudit(req.user, "deleted", "period", row.label);
+    res.json({ message: "Period removed." });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Could not delete the period." });
+  }
+});
+
+// ------------------------------------------------------------------
+// ONE CLASS'S GRID
+// ------------------------------------------------------------------
+
+// Builds { periods, days, slots, published } for one class + section.
+async function buildGrid(classId, sectionId) {
+  const periods = await query("SELECT * FROM periods ORDER BY start_time");
+
+  const section = await queryOne(
+    `SELECT sec.timetable_published, c.name AS class_name, sec.name AS section_name
+       FROM sections sec JOIN classes c ON c.id = sec.class_id
+      WHERE sec.id = $1 AND sec.class_id = $2`,
+    [sectionId, classId]
+  );
+
+  const rows = await query(
+    `SELECT tt.day_of_week, tt.period_id, tt.subject_id, tt.teacher_id,
+            sub.name AS subject_name, u.full_name AS teacher_name
+       FROM timetable_slots tt
+       LEFT JOIN subjects sub ON sub.id = tt.subject_id
+       LEFT JOIN teachers t   ON t.id = tt.teacher_id
+       LEFT JOIN users u      ON u.id = t.user_id
+      WHERE tt.class_id = $1 AND tt.section_id = $2`,
+    [classId, sectionId]
+  );
+
+  const slots = {};
+  rows.forEach(function (r) {
+    slots[r.day_of_week + "-" + r.period_id] = {
+      subject_id: r.subject_id,
+      subject_name: r.subject_name,
+      teacher_id: r.teacher_id,
+      teacher_name: r.teacher_name,
+    };
+  });
+
+  return {
+    class_name: section ? section.class_name : null,
+    section_name: section ? section.section_name : null,
+    published: section ? section.timetable_published : false,
+    periods: periods,
+    days: schoolDays().map(function (d) { return { value: d, label: DAY_NAMES[d] }; }),
+    slots: slots,
+  };
+}
+
+// GET /api/timetable/class/:classId/:sectionId
+router.get("/class/:classId/:sectionId", async function (req, res) {
+  try {
+    const classId = Number(req.params.classId);
+    const sectionId = Number(req.params.sectionId);
+
+    if (req.user.role === "teacher") {
+      const ok = await teacherOwnsSection(req.user.id, classId, sectionId);
+      if (!ok) return res.status(403).json({ message: "You are not assigned to this section." });
+    }
+
+    if (req.user.role === "student") {
+      const me = await getStudentOfUser(req.user.id);
+      if (!me || me.class_id !== classId || me.section_id !== sectionId) {
+        return res.status(403).json({ message: "That is not your class." });
+      }
+    }
+
+    if (req.user.role === "parent") {
+      const studentId = Number(req.query.student_id);
+      const ok = studentId && (await parentOwnsStudent(req.user.id, studentId));
+      if (!ok) return res.status(403).json({ message: "That is not your child." });
+      const child = await queryOne("SELECT class_id, section_id FROM students WHERE id = $1", [studentId]);
+      if (!child || child.class_id !== classId || child.section_id !== sectionId) {
+        return res.status(403).json({ message: "That is not your child's class." });
+      }
+    }
+
+    const grid = await buildGrid(classId, sectionId);
+
+    if (req.user.role !== "admin" && !grid.published) {
+      return res.status(403).json({ message: "The school has not published this timetable yet." });
+    }
+
+    res.json(grid);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Could not load the timetable." });
+  }
+});
+
+// ------------------------------------------------------------------
+// WHO TEACHES WHAT, in one section - the single source of truth the
+// timetable is built on.
+//
+// Each subject in a section has at most one teacher (the database
+// guarantees it), decided on the Teachers page. The timetable does not
+// get to disagree with that: picking a subject fixes the teacher, and
+// picking a teacher narrows the subjects to the ones they teach here.
+// The class teacher is also offered for periods with no subject (an
+// assembly, a study period), since they may teach nothing else here.
+// ------------------------------------------------------------------
+async function sectionOptions(classId, sectionId) {
+  const subjects = await query(
+    `SELECT sub.id, sub.name, t.id AS teacher_id, u.full_name AS teacher_name
+       FROM subjects sub
+       LEFT JOIN teacher_classes tc
+              ON tc.subject_id = sub.id AND tc.class_id = $1 AND tc.section_id = $2
+       LEFT JOIN teachers t ON t.id = tc.teacher_id
+       LEFT JOIN users u    ON u.id = t.user_id
+      WHERE sub.class_id = $1
+      ORDER BY sub.name`,
+    [classId, sectionId]
+  );
+
+  const teachers = await query(
+    `SELECT t.id, u.full_name AS name
+       FROM teachers t JOIN users u ON u.id = t.user_id
+      WHERE t.id IN (SELECT teacher_id FROM teacher_classes WHERE class_id = $1 AND section_id = $2)
+         OR t.id IN (SELECT class_teacher_id FROM sections WHERE id = $2 AND class_teacher_id IS NOT NULL)
+      ORDER BY u.full_name`,
+    [classId, sectionId]
+  );
+
+  teachers.forEach(function (t) {
+    t.subject_ids = subjects
+      .filter(function (s) { return s.teacher_id === t.id; })
+      .map(function (s) { return s.id; });
+  });
+
+  return { subjects: subjects, teachers: teachers };
+}
+
+// GET /api/timetable/options/:classId/:sectionId   (admin)
+router.get("/options/:classId/:sectionId", allow("admin"), async function (req, res) {
+  try {
+    res.json(await sectionOptions(Number(req.params.classId), Number(req.params.sectionId)));
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Could not load the subjects and teachers." });
+  }
+});
+
+// PUT /api/timetable/class/:classId/:sectionId/slot
+// { day_of_week, period_id, subject_id, teacher_id }
+// Sending both subject_id and teacher_id as empty clears the cell.
+router.put("/class/:classId/:sectionId/slot", allow("admin"), async function (req, res) {
+  try {
+    const classId = Number(req.params.classId);
+    const sectionId = Number(req.params.sectionId);
+    const { day_of_week, period_id } = req.body;
+    let subjectId = req.body.subject_id ? Number(req.body.subject_id) : null;
+    let teacherId = req.body.teacher_id ? Number(req.body.teacher_id) : null;
+
+    if (day_of_week === undefined || !period_id) {
+      return res.status(400).json({ message: "Choose a day and a period." });
+    }
+
+    const place = await queryOne(
+      `SELECT c.name AS class_name, sec.name AS section_name, p.label AS period_label
+         FROM classes c, sections sec, periods p
+        WHERE c.id = $1 AND sec.id = $2 AND p.id = $3`,
+      [classId, sectionId, period_id]
+    );
+    const where = place ? place.class_name + " - Section " + place.section_name : "a section";
+    const when = DAY_NAMES[day_of_week] + ", " + (place ? place.period_label : "a period");
+
+    // An empty cell is simply no row, so clearing just deletes it.
+    if (!subjectId && !teacherId) {
+      await query(
+        "DELETE FROM timetable_slots WHERE class_id=$1 AND section_id=$2 AND day_of_week=$3 AND period_id=$4",
+        [classId, sectionId, day_of_week, period_id]
+      );
+      res.json({ message: "Slot cleared." });
+      logAudit(req.user, "updated", "timetable", where, when + ": cleared");
+      return;
+    }
+
+    // Keep subject and teacher consistent with who really teaches what here.
+    const options = await sectionOptions(classId, sectionId);
+    let subjectName = null;
+    let teacherName = null;
+
+    if (subjectId) {
+      const subject = options.subjects.find(function (x) { return x.id === subjectId; });
+
+      if (!subject) {
+        return res.status(400).json({ message: "That subject doesn't belong to this class." });
+      }
+      if (!subject.teacher_id) {
+        return res.status(400).json({
+          message:
+            "No teacher is assigned to " + subject.name + " in " + where + " yet. " +
+            "Assign one from the Teachers page first, then come back to the timetable.",
+        });
+      }
+      if (teacherId && teacherId !== subject.teacher_id) {
+        return res.status(400).json({
+          message:
+            subject.name + " in " + where + " is taught by " + subject.teacher_name +
+            ", so nobody else can be placed on it. Change who teaches it from the Teachers page if that's wrong.",
+        });
+      }
+
+      // One teacher per subject per section: the subject decides the teacher.
+      teacherId = subject.teacher_id;
+      subjectName = subject.name;
+      teacherName = subject.teacher_name;
+    } else {
+      const teacher = options.teachers.find(function (x) { return x.id === teacherId; });
+      if (!teacher) {
+        return res.status(400).json({
+          message: "That teacher isn't assigned to " + where + ". Assign them from the Teachers page first.",
+        });
+      }
+      teacherName = teacher.name;
+    }
+
+    // A teacher cannot be in two places in the same period on the same day.
+    const clash = await queryOne(
+      `SELECT c.name AS class_name, sec.name AS section_name, p.label AS period_label
+         FROM timetable_slots tt
+         JOIN classes c    ON c.id = tt.class_id
+         JOIN sections sec ON sec.id = tt.section_id
+         JOIN periods p    ON p.id = tt.period_id
+        WHERE tt.teacher_id = $1 AND tt.day_of_week = $2 AND tt.period_id = $3
+          AND NOT (tt.class_id = $4 AND tt.section_id = $5)`,
+      [teacherId, day_of_week, period_id, classId, sectionId]
+    );
+
+    if (clash) {
+      return res.status(400).json({
+        message:
+          teacherName + " is already teaching " + clash.class_name + " - Section " + clash.section_name +
+          " on " + DAY_NAMES[day_of_week] + " in " + clash.period_label +
+          ". Choose a different period, or a different subject.",
+      });
+    }
+
+    await query(
+      `INSERT INTO timetable_slots (class_id, section_id, day_of_week, period_id, subject_id, teacher_id)
+       VALUES ($1,$2,$3,$4,$5,$6)
+       ON CONFLICT (class_id, section_id, day_of_week, period_id)
+       DO UPDATE SET subject_id = EXCLUDED.subject_id, teacher_id = EXCLUDED.teacher_id`,
+      [classId, sectionId, day_of_week, period_id, subjectId, teacherId]
+    );
+
+    res.json({ message: "Saved." });
+
+    logAudit(
+      req.user, "updated", "timetable", where,
+      when + ": " + (subjectName || "no subject") + " with " + teacherName
+    );
+  } catch (err) {
+    // A second safety net: if two admins save the same clash at the exact
+    // same moment, the database itself refuses it.
+    if (err.code === "23505") {
+      return res.status(400).json({
+        message: "That teacher is already teaching another class in this period. Choose someone else.",
+      });
+    }
+    console.error(err);
+    res.status(500).json({ message: "Could not save that slot." });
+  }
+});
+
+// PUT /api/timetable/class/:classId/:sectionId/publish   { published: true|false }
+router.put("/class/:classId/:sectionId/publish", allow("admin"), async function (req, res) {
+  try {
+    const sectionId = Number(req.params.sectionId);
+    const published = Boolean(req.body.published);
+
+    const section = await queryOne(
+      `SELECT sec.*, c.name AS class_name FROM sections sec
+         JOIN classes c ON c.id = sec.class_id WHERE sec.id = $1`,
+      [sectionId]
+    );
+    if (!section) return res.status(404).json({ message: "Section not found." });
+
+    await query("UPDATE sections SET timetable_published = $1 WHERE id = $2", [published, sectionId]);
+
+    const label = section.class_name + " - Section " + section.name;
+    logAudit(req.user, published ? "published" : "unpublished", "timetable", label);
+
+    res.json({
+      message: published
+        ? "Published. Teachers, students and parents in " + label + " can now see it."
+        : "Unpublished. Only you can see this timetable now.",
+      published: published,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Could not change the timetable's status." });
+  }
+});
+
+// ------------------------------------------------------------------
+// GET /api/timetable/my   (teacher) - their own personal weekly schedule,
+// assembled from every published section they have a slot in.
+// ------------------------------------------------------------------
+router.get("/my", allow("teacher"), async function (req, res) {
+  try {
+    const teacher = await getTeacherOfUser(req.user.id);
+    if (!teacher) return res.json({ periods: [], days: [], slots: {} });
+
+    const periods = await query("SELECT * FROM periods ORDER BY start_time");
+
+    const rows = await query(
+      `SELECT tt.day_of_week, tt.period_id, sub.name AS subject_name,
+              c.name AS class_name, sec.name AS section_name
+         FROM timetable_slots tt
+         JOIN sections sec ON sec.id = tt.section_id
+         JOIN classes c    ON c.id = tt.class_id
+         LEFT JOIN subjects sub ON sub.id = tt.subject_id
+        WHERE tt.teacher_id = $1 AND sec.timetable_published = TRUE`,
+      [teacher.id]
+    );
+
+    const slots = {};
+    rows.forEach(function (r) {
+      slots[r.day_of_week + "-" + r.period_id] = {
+        subject_name: r.subject_name,
+        class_name: r.class_name,
+        section_name: r.section_name,
+      };
+    });
+
+    res.json({
+      periods: periods,
+      days: schoolDays().map(function (d) { return { value: d, label: DAY_NAMES[d] }; }),
+      slots: slots,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Could not load your timetable." });
+  }
+});
+
+module.exports = router;
