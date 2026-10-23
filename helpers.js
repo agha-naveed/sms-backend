@@ -5,22 +5,28 @@ const multer = require("multer");
 const { query } = require("./db");
 
 // ---- file uploads ----------------------------------------------
-// Files are saved in server/uploads with a unique name so two people
-// uploading "homework.pdf" do not overwrite each other.
-const storage = multer.diskStorage({
-  destination: function (req, file, done) {
-    done(null, path.join(__dirname, "uploads"));
-  },
-  filename: function (req, file, done) {
-    const stamp = Date.now() + "-" + Math.round(Math.random() * 100000);
-    done(null, stamp + path.extname(file.originalname).toLowerCase());
-  },
+// Files are kept in memory just long enough to be sent to Cloudinary, then
+// the Cloudinary link is stored in the database. Nothing is written to the
+// server's disk (so nothing is lost when the host restarts or redeploys).
+//
+// Routes keep using upload.single("field") exactly as before. After the
+// upload, req.file.filename holds the full Cloudinary https link, and that
+// is what gets saved in the database.
+const { v2: cloudinary } = require("cloudinary");
+
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
+  secure: true,
 });
 
 const ALLOWED = [".jpg", ".jpeg", ".png", ".pdf", ".doc", ".docx"];
+const IMAGE_LIKE = [".jpg", ".jpeg", ".png", ".pdf"];
+const CLOUDINARY_FOLDER = process.env.CLOUDINARY_FOLDER || "sms";
 
-const upload = multer({
-  storage: storage,
+const memoryUpload = multer({
+  storage: multer.memoryStorage(),
   limits: { fileSize: 5 * 1024 * 1024 }, // 5 MB
   fileFilter: function (req, file, done) {
     const ext = path.extname(file.originalname).toLowerCase();
@@ -31,6 +37,59 @@ const upload = multer({
     }
   },
 });
+
+// Sends one in-memory file to Cloudinary and resolves with its https link.
+function sendToCloudinary(file) {
+  const ext = path.extname(file.originalname).toLowerCase();
+  const stamp = Date.now() + "-" + Math.round(Math.random() * 100000);
+  const isImageLike = IMAGE_LIKE.includes(ext);
+
+  return new Promise(function (resolve, reject) {
+    const stream = cloudinary.uploader.upload_stream(
+      {
+        folder: CLOUDINARY_FOLDER,
+        // Images and PDFs are stored as "image" and Word files as "raw".
+        // Raw files need the extension kept in their name to open properly.
+        resource_type: isImageLike ? "image" : "raw",
+        public_id: isImageLike ? stamp : stamp + ext,
+        use_filename: false,
+        unique_filename: false,
+      },
+      function (err, result) {
+        if (err) return reject(err);
+        resolve(result.secure_url);
+      }
+    );
+    stream.end(file.buffer);
+  });
+}
+
+// Drop-in replacement for the old disk upload. Same call, same errors.
+const upload = {
+  single: function (field) {
+    const receive = memoryUpload.single(field);
+
+    return function (req, res, next) {
+      receive(req, res, async function (err) {
+        if (err) return next(err);
+        if (!req.file) return next();
+
+        if (!process.env.CLOUDINARY_CLOUD_NAME || !process.env.CLOUDINARY_API_KEY || !process.env.CLOUDINARY_API_SECRET) {
+          return next(new Error("File storage is not set up. Add the Cloudinary keys to the server's .env file."));
+        }
+
+        try {
+          req.file.filename = await sendToCloudinary(req.file);
+          req.file.path = req.file.filename;
+          next();
+        } catch (e) {
+          console.error("Cloudinary upload failed:", e.message);
+          next(new Error("Could not upload the file. Please try again."));
+        }
+      });
+    };
+  },
+};
 
 // ---- phone numbers and CNIC ------------------------------------
 // Stored in one shape so searching and printing are predictable:
