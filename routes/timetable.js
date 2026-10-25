@@ -16,6 +16,7 @@ const {
   requireLogin, allow, teacherOwnsSection, parentOwnsStudent, getStudentOfUser, getTeacherOfUser,
 } = require("../auth");
 const { DAY_NAMES, WEEKLY_HOLIDAY, logAudit } = require("../helpers");
+const { newDocument, addTimetablePage, sendPdf } = require("../timetablePdf");
 
 const router = express.Router();
 router.use(requireLogin);
@@ -255,33 +256,39 @@ async function buildGrid(classId, sectionId) {
   };
 }
 
+// Who may see one class's timetable. Returns an error message, or null when
+// the person is allowed. Admin: any class. Teacher: their own sections.
+// Student: their own class. Parent: their own child's class.
+async function classAccessError(req, classId, sectionId) {
+  if (req.user.role === "teacher") {
+    const ok = await teacherOwnsSection(req.user.id, classId, sectionId);
+    if (!ok) return "You are not assigned to this section.";
+  }
+
+  if (req.user.role === "student") {
+    const me = await getStudentOfUser(req.user.id);
+    if (!me || me.class_id !== classId || me.section_id !== sectionId) return "That is not your class.";
+  }
+
+  if (req.user.role === "parent") {
+    const studentId = Number(req.query.student_id);
+    const ok = studentId && (await parentOwnsStudent(req.user.id, studentId));
+    if (!ok) return "That is not your child.";
+    const child = await queryOne("SELECT class_id, section_id FROM students WHERE id = $1", [studentId]);
+    if (!child || child.class_id !== classId || child.section_id !== sectionId) return "That is not your child's class.";
+  }
+
+  return null;
+}
+
 // GET /api/timetable/class/:classId/:sectionId
 router.get("/class/:classId/:sectionId", async function (req, res) {
   try {
     const classId = Number(req.params.classId);
     const sectionId = Number(req.params.sectionId);
 
-    if (req.user.role === "teacher") {
-      const ok = await teacherOwnsSection(req.user.id, classId, sectionId);
-      if (!ok) return res.status(403).json({ message: "You are not assigned to this section." });
-    }
-
-    if (req.user.role === "student") {
-      const me = await getStudentOfUser(req.user.id);
-      if (!me || me.class_id !== classId || me.section_id !== sectionId) {
-        return res.status(403).json({ message: "That is not your class." });
-      }
-    }
-
-    if (req.user.role === "parent") {
-      const studentId = Number(req.query.student_id);
-      const ok = studentId && (await parentOwnsStudent(req.user.id, studentId));
-      if (!ok) return res.status(403).json({ message: "That is not your child." });
-      const child = await queryOne("SELECT class_id, section_id FROM students WHERE id = $1", [studentId]);
-      if (!child || child.class_id !== classId || child.section_id !== sectionId) {
-        return res.status(403).json({ message: "That is not your child's class." });
-      }
-    }
+    const denied = await classAccessError(req, classId, sectionId);
+    if (denied) return res.status(403).json({ message: denied });
 
     const grid = await buildGrid(classId, sectionId);
 
@@ -508,41 +515,151 @@ router.put("/class/:classId/:sectionId/publish", allow("admin"), async function 
 // GET /api/timetable/my   (teacher) - their own personal weekly schedule,
 // assembled from every published section they have a slot in.
 // ------------------------------------------------------------------
+// A teacher's personal grid, shared by the screen and the PDF.
+async function buildTeacherGrid(userId) {
+  const teacher = await getTeacherOfUser(userId);
+  if (!teacher) return { periods: [], days: [], slots: {} };
+
+  const periods = await query("SELECT * FROM periods ORDER BY start_time");
+
+  const rows = await query(
+    `SELECT tt.day_of_week, tt.period_id, sub.name AS subject_name,
+            c.name AS class_name, sec.name AS section_name
+       FROM timetable_slots tt
+       JOIN sections sec ON sec.id = tt.section_id
+       JOIN classes c    ON c.id = tt.class_id
+       LEFT JOIN subjects sub ON sub.id = tt.subject_id
+      WHERE tt.teacher_id = $1 AND sec.timetable_published = TRUE`,
+    [teacher.id]
+  );
+
+  const slots = {};
+  rows.forEach(function (r) {
+    slots[r.day_of_week + "-" + r.period_id] = {
+      subject_name: r.subject_name,
+      class_name: r.class_name,
+      section_name: r.section_name,
+    };
+  });
+
+  return {
+    periods: periods,
+    days: schoolDays().map(function (d) { return { value: d, label: DAY_NAMES[d] }; }),
+    slots: slots,
+  };
+}
+
 router.get("/my", allow("teacher"), async function (req, res) {
   try {
-    const teacher = await getTeacherOfUser(req.user.id);
-    if (!teacher) return res.json({ periods: [], days: [], slots: {} });
-
-    const periods = await query("SELECT * FROM periods ORDER BY start_time");
-
-    const rows = await query(
-      `SELECT tt.day_of_week, tt.period_id, sub.name AS subject_name,
-              c.name AS class_name, sec.name AS section_name
-         FROM timetable_slots tt
-         JOIN sections sec ON sec.id = tt.section_id
-         JOIN classes c    ON c.id = tt.class_id
-         LEFT JOIN subjects sub ON sub.id = tt.subject_id
-        WHERE tt.teacher_id = $1 AND sec.timetable_published = TRUE`,
-      [teacher.id]
-    );
-
-    const slots = {};
-    rows.forEach(function (r) {
-      slots[r.day_of_week + "-" + r.period_id] = {
-        subject_name: r.subject_name,
-        class_name: r.class_name,
-        section_name: r.section_name,
-      };
-    });
-
-    res.json({
-      periods: periods,
-      days: schoolDays().map(function (d) { return { value: d, label: DAY_NAMES[d] }; }),
-      slots: slots,
-    });
+    res.json(await buildTeacherGrid(req.user.id));
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: "Could not load your timetable." });
+  }
+});
+
+// ------------------------------------------------------------------
+// PDF DOWNLOADS
+//   GET /api/timetable/pdf/class/:classId/:sectionId   one class
+//        admin: any class. teacher: own sections. student / parent: their
+//        own class only (parents pass ?student_id=). Non-admins only get
+//        a timetable that has been published.
+//   GET /api/timetable/pdf/all                          admin: every class
+//        with a timetable (optionally ?class_id= for one whole class)
+//   GET /api/timetable/pdf/my                           teacher: own timetable
+// ------------------------------------------------------------------
+function classPage(grid) {
+  return {
+    title: grid.class_name + " - Section " + grid.section_name,
+    subtitle: "Weekly timetable",
+    periods: grid.periods,
+    days: grid.days,
+    slots: grid.slots,
+    cellLines: function (cell) {
+      return [cell.subject_name || "General", cell.teacher_name || "No teacher"];
+    },
+  };
+}
+
+router.get("/pdf/class/:classId/:sectionId", async function (req, res) {
+  try {
+    if (req.user.role === "teacher") {
+      // Teachers download their own personal timetable (/pdf/my) instead.
+      return res.status(403).json({ message: "Download your own timetable instead." });
+    }
+
+    const classId = Number(req.params.classId);
+    const sectionId = Number(req.params.sectionId);
+
+    const denied = await classAccessError(req, classId, sectionId);
+    if (denied) return res.status(403).json({ message: denied });
+
+    const grid = await buildGrid(classId, sectionId);
+    if (!grid.class_name) return res.status(404).json({ message: "Class not found." });
+
+    if (req.user.role !== "admin" && !grid.published) {
+      return res.status(403).json({ message: "The school has not published this timetable yet." });
+    }
+
+    const doc = newDocument();
+    addTimetablePage(doc, classPage(grid));
+    sendPdf(res, doc, "timetable-" + grid.class_name + "-" + grid.section_name + ".pdf");
+  } catch (err) {
+    console.error(err);
+    if (!res.headersSent) res.status(500).json({ message: "Could not create the PDF." });
+  }
+});
+
+router.get("/pdf/all", allow("admin"), async function (req, res) {
+  try {
+    const classId = req.query.class_id ? Number(req.query.class_id) : null;
+
+    const sections = await query(
+      `SELECT sec.id AS section_id, sec.class_id
+         FROM sections sec JOIN classes c ON c.id = sec.class_id
+        WHERE ($1::int IS NULL OR sec.class_id = $1)
+          AND EXISTS (SELECT 1 FROM timetable_slots t WHERE t.section_id = sec.id)
+        ORDER BY c.name, sec.name`,
+      [classId]
+    );
+
+    if (sections.length === 0) {
+      return res.status(404).json({ message: "No class has a timetable to download yet." });
+    }
+
+    const doc = newDocument();
+    for (const s of sections) {
+      addTimetablePage(doc, classPage(await buildGrid(s.class_id, s.section_id)));
+    }
+    sendPdf(res, doc, classId ? "timetables-class.pdf" : "timetables-all-classes.pdf");
+  } catch (err) {
+    console.error(err);
+    if (!res.headersSent) res.status(500).json({ message: "Could not create the PDF." });
+  }
+});
+
+router.get("/pdf/my", allow("teacher"), async function (req, res) {
+  try {
+    const grid = await buildTeacherGrid(req.user.id);
+    if (Object.keys(grid.slots).length === 0) {
+      return res.status(404).json({ message: "You have no published timetable to download yet." });
+    }
+
+    const doc = newDocument();
+    addTimetablePage(doc, {
+      title: req.user.name + " - Timetable",
+      subtitle: "Weekly timetable",
+      periods: grid.periods,
+      days: grid.days,
+      slots: grid.slots,
+      cellLines: function (cell) {
+        return [cell.class_name + " - " + cell.section_name, cell.subject_name || "General"];
+      },
+    });
+    sendPdf(res, doc, "my-timetable.pdf");
+  } catch (err) {
+    console.error(err);
+    if (!res.headersSent) res.status(500).json({ message: "Could not create the PDF." });
   }
 });
 
