@@ -9,7 +9,7 @@ const {
 } = require("../auth");
 const {
   cleanPhone, cleanCnic, DEFAULT_PASSWORD, nextAdmissionNo, schoolEmail, parentClash,
-  emailOwner, phoneIdentity, phoneProblem, logAudit, randomPassword,
+  emailOwner, phoneIdentity, phoneProblem, logAudit, randomPassword, parentSchoolEmail,
 } = require("../helpers");
 
 const router = express.Router();
@@ -144,9 +144,16 @@ router.post("/", allow("admin"), async function (req, res) {
       });
     }
 
+    // Registration number and login are generated unless the admin typed one.
+    const admissionNo = b.admission_no || (await nextAdmissionNo());
+
     await client.query("BEGIN");
 
-    if (!parentId && b.parent_name && b.parent_email) {
+    // A parent is made from the details given. The same CNIC means the same
+    // parent, so a second child is linked to the existing account. A parent
+    // with no email of their own gets a school email made from the
+    // registration number.
+    if (!parentId && (b.parent_name || b.parent_email || b.parent_cnic)) {
       const parentPhone = cleanPhone(b.parent_phone);
       if (b.parent_phone && !parentPhone) {
         await client.query("ROLLBACK");
@@ -159,68 +166,82 @@ router.post("/", allow("admin"), async function (req, res) {
         return res.status(400).json({ message: "A CNIC must have 13 digits." });
       }
 
-      // Reuse the account if that email already signs in here.
-      let parentUser = await queryOne("SELECT * FROM users WHERE LOWER(email) = LOWER($1)", [
-        b.parent_email,
-      ]);
-
-      if (parentUser && parentUser.role !== "parent") {
-        await client.query("ROLLBACK");
-        return res.status(400).json({
-          message: b.parent_email + " is already used by " + parentUser.full_name +
-            " (" + parentUser.role + ").",
-        });
-      }
-
-      if (!parentUser) {
-        const phoneCheck = await phoneIdentity(parentPhone, b.parent_name, "parent", null);
-        const phoneMessage = phoneProblem(phoneCheck, parentPhone);
-        if (phoneMessage) {
-          await client.query("ROLLBACK");
-          return res.status(400).json({ message: phoneMessage });
+      if (parentCnic) {
+        const sameCnic = await queryOne(
+          "SELECT p.id, u.email FROM parents p JOIN users u ON u.id = p.user_id WHERE p.cnic = $1 LIMIT 1",
+          [parentCnic]
+        );
+        if (sameCnic) {
+          parentId = sameCnic.id;
+          parentLogin = { email: sameCnic.email, password: "(existing account, unchanged)" };
         }
       }
 
-      // A CNIC or a mobile number belongs to one parent only.
-      if (!parentUser) {
-        const clash = await parentClash(parentCnic, parentPhone, null);
-        if (clash) {
+      if (!parentId) {
+        if (!b.parent_name) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({ message: "Enter the parent's name." });
+        }
+
+        const parentEmail = (b.parent_email || "").trim() || parentSchoolEmail(admissionNo);
+
+        // Reuse the account if that email already signs in here.
+        let parentUser = await queryOne("SELECT * FROM users WHERE LOWER(email) = LOWER($1)", [
+          parentEmail,
+        ]);
+
+        if (parentUser && parentUser.role !== "parent") {
           await client.query("ROLLBACK");
           return res.status(400).json({
-            message: "That " + clash.field + " already belongs to " + clash.name +
-              " (" + clash.email + "). Use \"Link an existing parent\" instead.",
+            message: parentEmail + " is already used by " + parentUser.full_name +
+              " (" + parentUser.role + ").",
           });
         }
+
+        if (!parentUser) {
+          const phoneCheck = await phoneIdentity(parentPhone, b.parent_name, "parent", null);
+          const phoneMessage = phoneProblem(phoneCheck, parentPhone);
+          if (phoneMessage) {
+            await client.query("ROLLBACK");
+            return res.status(400).json({ message: phoneMessage });
+          }
+
+          // A mobile number belongs to one parent only.
+          const clash = await parentClash(null, parentPhone, null);
+          if (clash) {
+            await client.query("ROLLBACK");
+            return res.status(400).json({
+              message: "That " + clash.field + " already belongs to " + clash.name +
+                " (" + clash.email + "). Use \"Link an existing parent\" instead.",
+            });
+          }
+
+          const made = await client.query(
+            `INSERT INTO users (full_name, email, password, phone, role)
+             VALUES ($1,$2,$3,$4,'parent') RETURNING *`,
+            [b.parent_name, parentEmail, hashPassword(DEFAULT_PASSWORD), parentPhone]
+          );
+          parentUser = made.rows[0];
+          parentLogin = { email: parentEmail, password: DEFAULT_PASSWORD };
+        } else {
+          parentLogin = { email: parentEmail, password: "(existing account, unchanged)" };
+        }
+
+        let parent = await queryOne("SELECT * FROM parents WHERE user_id = $1", [parentUser.id]);
+
+        if (!parent) {
+          const made = await client.query(
+            "INSERT INTO parents (user_id, cnic, address) VALUES ($1,$2,$3) RETURNING *",
+            [parentUser.id, parentCnic, b.address || null]
+          );
+          parent = made.rows[0];
+        }
+
+        parentId = parent.id;
       }
-
-      if (!parentUser) {
-        const made = await client.query(
-          `INSERT INTO users (full_name, email, password, phone, role)
-           VALUES ($1,$2,$3,$4,'parent') RETURNING *`,
-          [b.parent_name, b.parent_email, hashPassword(DEFAULT_PASSWORD), parentPhone]
-        );
-        parentUser = made.rows[0];
-        parentLogin = { email: b.parent_email, password: DEFAULT_PASSWORD };
-      } else {
-        parentLogin = { email: b.parent_email, password: "(existing account, unchanged)" };
-      }
-
-      let parent = await queryOne("SELECT * FROM parents WHERE user_id = $1", [parentUser.id]);
-
-      if (!parent) {
-        const made = await client.query(
-          "INSERT INTO parents (user_id, cnic, address) VALUES ($1,$2,$3) RETURNING *",
-          [parentUser.id, parentCnic, b.address || null]
-        );
-        parent = made.rows[0];
-      }
-
-      parentId = parent.id;
     }
 
-    // Registration number and login are generated unless the admin typed one.
-    const admissionNo = b.admission_no || (await nextAdmissionNo());
-
+    // The registration number must not already belong to another student.
     const clash = await queryOne("SELECT id FROM students WHERE admission_no = $1", [admissionNo]);
     if (clash) {
       await client.query("ROLLBACK");

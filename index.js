@@ -35,6 +35,7 @@ app.use("/api/teacher-attendance", require("./routes/teacherAttendance"));
 app.use("/api/timetable", require("./routes/timetable"));
 app.use("/api/password-requests", require("./routes/passwordRequests"));
 app.use("/api/files", require("./routes/files"));
+app.use("/api/student-import", require("./routes/studentImport"));
 
 app.get("/api/health", function (req, res) {
   res.json({ ok: true, time: new Date() });

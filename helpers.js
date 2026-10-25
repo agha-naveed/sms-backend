@@ -159,6 +159,13 @@ function schoolEmail(admissionNo) {
   return admissionNo + "@school.com";
 }
 
+// The login made for a parent who has no email of their own. It is based on
+// the registration number of their first child, so it is always unique,
+// for example parent-2026-0007@school.com.
+function parentSchoolEmail(admissionNo) {
+  return "parent-" + admissionNo + "@school.com";
+}
+
 // Finds a parent account already using this CNIC or mobile number.
 // Returns null when the details are free to use.
 // Pass ignoreParentId when editing, so a parent does not clash with itself.
@@ -534,7 +541,7 @@ function withTotals(slip) {
 module.exports = {
   upload, notify, calcLateFee, daysOverdue, withTotals, monthRangeLabel, MONTHS,
   cleanPhone, cleanCnic,
-  DEFAULT_PASSWORD, randomPassword, nextAdmissionNo, schoolEmail, parentClash,
+  DEFAULT_PASSWORD, randomPassword, nextAdmissionNo, schoolEmail, parentSchoolEmail, parentClash,
   emailOwner, staffEmail, WEEKLY_HOLIDAY, DAY_NAMES, parentIdentity, phoneIdentity, phoneProblem,
   getAttendanceWindow, isWithinWindow, friendlyTime, logAudit,
   resolveRange, todayText, asDateText,
