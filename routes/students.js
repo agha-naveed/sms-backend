@@ -340,31 +340,6 @@ router.put("/:id", allow("admin"), async function (req, res) {
   }
 });
 
-// PUT /api/students/:id/reset-password  (admin)
-// A student's login is a registration number and a school-style address,
-// not something they can recover by themselves. This is the normal way
-// a forgotten student password gets fixed. Shown once.
-router.put("/:id/reset-password", allow("admin"), async function (req, res) {
-  try {
-    const student = await queryOne(
-      `SELECT s.*, u.full_name AS name, u.id AS user_id FROM students s
-         JOIN users u ON u.id = s.user_id WHERE s.id = $1`,
-      [req.params.id]
-    );
-    if (!student) return res.status(404).json({ message: "Student not found." });
-
-    const newPassword = randomPassword();
-    await query("UPDATE users SET password = $1 WHERE id = $2", [hashPassword(newPassword), student.user_id]);
-
-    res.json({ message: "Password reset.", password: newPassword });
-
-    logAudit(req.user, "reset", "password", student.name + " (" + student.admission_no + ")");
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: "Could not reset the password." });
-  }
-});
-
 // POST /api/students/:id/promote  -> move to another class + section
 router.post("/:id/promote", allow("admin"), async function (req, res) {
   try {

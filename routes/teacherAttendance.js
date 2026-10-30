@@ -1,3 +1,6 @@
+// Statuses: present, late (came in after the start time), absent, leave.
+// Late counts as attended in the percentage but is reported on its own.
+//
 // Teacher attendance works like student attendance, but simpler: the admin
 // marks it for everyone, there is no time window and no "class teacher"
 // idea, since it's the admin doing the marking.
@@ -49,7 +52,7 @@ router.post("/mark", allow("admin"), async function (req, res) {
       return res.status(400).json({ message: "Nothing to save." });
     }
 
-    const bad = records.some(function (r) { return !["present", "absent", "leave"].includes(r.status); });
+    const bad = records.some(function (r) { return !["present", "late", "absent", "leave"].includes(r.status); });
     if (bad) return res.status(400).json({ message: "Mark every teacher before you submit." });
 
     for (const r of records) {
@@ -63,10 +66,11 @@ router.post("/mark", allow("admin"), async function (req, res) {
     }
 
     const absent = records.filter(function (r) { return r.status === "absent"; }).length;
+    const late = records.filter(function (r) { return r.status === "late"; }).length;
 
-    res.json({ message: "Staff attendance submitted.", total: records.length, absent: absent });
+    res.json({ message: "Staff attendance submitted.", total: records.length, absent: absent, late: late });
 
-    logAudit(req.user, "marked", "teacher_attendance", "Staff attendance for " + date, records.length + " teachers, " + absent + " absent");
+    logAudit(req.user, "marked", "teacher_attendance", "Staff attendance for " + date, records.length + " teachers, " + absent + " absent, " + late + " late");
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: "Could not save staff attendance." });
@@ -94,6 +98,7 @@ router.get("/report", allow("admin", "teacher"), async function (req, res) {
       `SELECT t.id AS teacher_id, u.full_name AS name,
               COUNT(ta.id)::int AS marked,
               COUNT(ta.id) FILTER (WHERE ta.status = 'present')::int AS present,
+              COUNT(ta.id) FILTER (WHERE ta.status = 'late')::int    AS late,
               COUNT(ta.id) FILTER (WHERE ta.status = 'absent')::int  AS absent,
               COUNT(ta.id) FILTER (WHERE ta.status = 'leave')::int   AS on_leave
          FROM teachers t
@@ -106,13 +111,15 @@ router.get("/report", allow("admin", "teacher"), async function (req, res) {
     );
 
     const teachers = byTeacher.map(function (r) {
-      return { ...r, percentage: r.marked === 0 ? 0 : Math.round((r.present / r.marked) * 100) };
+      // A late teacher still came in, so late counts as attended.
+      return { ...r, percentage: r.marked === 0 ? 0 : Math.round(((r.present + r.late) / r.marked) * 100) };
     });
 
     const byDay = await query(
       `SELECT ta.date,
               COUNT(*)::int AS marked,
               COUNT(*) FILTER (WHERE ta.status = 'present')::int AS present,
+              COUNT(*) FILTER (WHERE ta.status = 'late')::int    AS late,
               COUNT(*) FILTER (WHERE ta.status = 'absent')::int  AS absent,
               COUNT(*) FILTER (WHERE ta.status = 'leave')::int   AS on_leave
          FROM teacher_attendance ta
@@ -123,9 +130,9 @@ router.get("/report", allow("admin", "teacher"), async function (req, res) {
       filters
     );
 
-    let present = 0, absent = 0, onLeave = 0, marked = 0;
+    let present = 0, late = 0, absent = 0, onLeave = 0, marked = 0;
     for (const t of teachers) {
-      present += t.present; absent += t.absent; onLeave += t.on_leave; marked += t.marked;
+      present += t.present; late += t.late; absent += t.absent; onLeave += t.on_leave; marked += t.marked;
     }
 
     res.json({
@@ -136,9 +143,10 @@ router.get("/report", allow("admin", "teacher"), async function (req, res) {
         teachers: teachers.length,
         marked: marked,
         present: present,
+        late: late,
         absent: absent,
         on_leave: onLeave,
-        percentage: marked === 0 ? 0 : Math.round((present / marked) * 100),
+        percentage: marked === 0 ? 0 : Math.round(((present + late) / marked) * 100),
       },
       by_teacher: teacherId ? [] : teachers,
       by_day: byDay,

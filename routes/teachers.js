@@ -363,31 +363,6 @@ router.delete("/classes/:linkId", allow("admin"), async function (req, res) {
 });
 
 // DELETE /api/teachers/:id  -> removes the teacher and their login
-// PUT /api/teachers/:id/reset-password  (admin)
-// For when a teacher forgets their password. Their login is a school
-// address, not a real inbox, so this - not a self-service email - is the
-// normal way it gets fixed. Shown once, the same as when the account was
-// first created.
-router.put("/:id/reset-password", allow("admin"), async function (req, res) {
-  try {
-    const teacher = await queryOne(
-      "SELECT t.*, u.full_name AS name FROM teachers t JOIN users u ON u.id = t.user_id WHERE t.id = $1",
-      [req.params.id]
-    );
-    if (!teacher) return res.status(404).json({ message: "Teacher not found." });
-
-    const newPassword = randomPassword();
-    await query("UPDATE users SET password = $1 WHERE id = $2", [hashPassword(newPassword), teacher.user_id]);
-
-    res.json({ message: "Password reset.", password: newPassword });
-
-    logAudit(req.user, "reset", "password", teacher.name + " (teacher)");
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: "Could not reset the password." });
-  }
-});
-
 router.delete("/:id", allow("admin"), async function (req, res) {
   try {
     const teacher = await queryOne(
