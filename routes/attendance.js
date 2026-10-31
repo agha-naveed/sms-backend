@@ -3,6 +3,7 @@ const { query, queryOne } = require("../db");
 const {
   requireLogin,
   allow,
+  getTeacherOfUser,
   teacherOwnsSection,
   teacherIsClassTeacher,
   parentOwnsStudent,
@@ -23,6 +24,21 @@ function today() {
 
 function asDate(value) {
   return asDateText(value);
+}
+
+// An approved request that lets this class teacher submit this section's
+// attendance for this date once more (see "REOPEN REQUESTS" below).
+async function approvedReopen(userId, classId, sectionId, date) {
+  const teacher = await getTeacherOfUser(userId);
+  if (!teacher) return null;
+
+  return await queryOne(
+    `SELECT * FROM attendance_requests
+      WHERE teacher_id = $1 AND class_id = $2 AND section_id = $3
+        AND date = $4 AND status = 'approved'
+      ORDER BY decided_at DESC LIMIT 1`,
+    [teacher.id, classId, sectionId, date]
+  );
 }
 
 // ------------------------------------------------------------------
@@ -65,6 +81,23 @@ router.get("/roster", allow("teacher", "admin"), async function (req, res) {
 
     const window = await getAttendanceWindow();
 
+    // A teacher may have asked the admin to open this sheet once more.
+    let reopened = false;
+    let request = null;
+    if (req.user.role === "teacher") {
+      const teacher = await getTeacherOfUser(req.user.id);
+      if (teacher) {
+        request = await queryOne(
+          `SELECT id, status, reason, admin_note FROM attendance_requests
+            WHERE teacher_id = $1 AND class_id = $2 AND section_id = $3 AND date = $4
+              AND status IN ('pending','approved','rejected')
+            ORDER BY created_at DESC LIMIT 1`,
+          [teacher.id, class_id, section_id, date]
+        );
+        reopened = !!request && request.status === "approved";
+      }
+    }
+
     res.json({
       date: date,
       is_holiday: isHoliday,
@@ -72,8 +105,11 @@ router.get("/roster", allow("teacher", "admin"), async function (req, res) {
       already_marked: students.some(function (s) { return s.attendance_id !== null; }),
       students: students,
       attendance_window: window,
-      // The admin can always act; a teacher only inside the window.
-      within_window: req.user.role === "admin" || isWithinWindow(window),
+      // The admin can always act; a teacher only inside the window, or when
+      // the admin has reopened this sheet for them.
+      within_window: req.user.role === "admin" || reopened || isWithinWindow(window),
+      reopened: reopened,
+      request: request,
     });
   } catch (err) {
     console.error(err);
@@ -91,6 +127,7 @@ router.post("/mark", allow("teacher", "admin"), async function (req, res) {
   try {
     const { class_id, section_id, records } = req.body;
     const date = req.body.date || today();
+    let reopen = null;   // the approved request this submit uses, if any
 
     if (!class_id || !section_id || !Array.isArray(records) || records.length === 0) {
       return res.status(400).json({ message: "Nothing to save." });
@@ -105,9 +142,12 @@ router.post("/mark", allow("teacher", "admin"), async function (req, res) {
       }
 
       // The class teacher can only submit inside the daily window. The
-      // admin is exempt, so a mistake can still be fixed outside it.
+      // admin is exempt, so a mistake can still be fixed outside it. An
+      // approved reopen request also lets the teacher submit, once.
+      reopen = await approvedReopen(req.user.id, class_id, section_id, date);
+
       const window = await getAttendanceWindow();
-      if (!isWithinWindow(window)) {
+      if (!reopen && !isWithinWindow(window)) {
         return res.status(400).json({
           message:
             "Attendance can only be submitted between " + friendlyTime(window.start) +
@@ -138,11 +178,20 @@ router.post("/mark", allow("teacher", "admin"), async function (req, res) {
         WHERE class_id = $1 AND section_id = $2 AND date = $3 LIMIT 1`,
       [class_id, section_id, date]
     );
-    if (existing && req.user.role === "teacher") {
+    if (existing && req.user.role === "teacher" && !reopen) {
       return res.status(400).json({
-        message: "Attendance for this date is already submitted. Ask the admin to change it.",
+        message: "Attendance for this date is already submitted. Send the admin a request to open it once more.",
       });
     }
+
+    // What each student was marked before, so a parent is only told about a
+    // new absence and not about one they already know of.
+    const beforeRows = await query(
+      "SELECT student_id, status FROM attendance WHERE class_id = $1 AND section_id = $2 AND date = $3",
+      [class_id, section_id, date]
+    );
+    const before = {};
+    beforeRows.forEach(function (b) { before[b.student_id] = b.status; });
 
     // Save every row. ON CONFLICT lets the admin correct a mistake.
     for (const r of records) {
@@ -160,9 +209,16 @@ router.post("/mark", allow("teacher", "admin"), async function (req, res) {
       .filter(function (r) { return r.status === "absent"; })
       .map(function (r) { return r.student_id; });
 
+    const newlyAbsentIds = absentIds.filter(function (id) { return before[id] !== "absent"; });
+
+    // The reopen request is spent: the teacher got their one correction.
+    if (reopen) {
+      await query("UPDATE attendance_requests SET status = 'used' WHERE id = $1", [reopen.id]);
+    }
+
     let notified = 0;
 
-    if (absentIds.length > 0) {
+    if (newlyAbsentIds.length > 0) {
       const absentees = await query(
         `SELECT s.id, u.full_name AS student_name,
                 pu.id AS parent_user_id,
@@ -174,7 +230,7 @@ router.post("/mark", allow("teacher", "admin"), async function (req, res) {
            LEFT JOIN classes c    ON c.id = s.class_id
            LEFT JOIN sections sec ON sec.id = s.section_id
           WHERE s.id = ANY($1::int[])`,
-        [absentIds]
+        [newlyAbsentIds]
       );
 
       const nice = new Date(date).toDateString();
@@ -217,6 +273,182 @@ router.post("/mark", allow("teacher", "admin"), async function (req, res) {
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: "Could not save the attendance." });
+  }
+});
+
+// ------------------------------------------------------------------
+// REOPEN REQUESTS
+// Once attendance is locked (the window is over, or it was submitted) only
+// the admin can change it. A student may have a good reason for being late,
+// so the class teacher can ask the admin to open it once more. An approved
+// request lets the teacher submit that section and date one more time.
+// ------------------------------------------------------------------
+
+// POST /api/attendance/requests   (class teacher asks)
+router.post("/requests", allow("teacher"), async function (req, res) {
+  try {
+    const { class_id, section_id, reason } = req.body;
+    const date = req.body.date || today();
+
+    if (!class_id || !section_id || !reason || !String(reason).trim()) {
+      return res.status(400).json({ message: "Tell the admin why attendance needs to be opened again." });
+    }
+
+    const isClassTeacher = await teacherIsClassTeacher(req.user.id, class_id, section_id);
+    if (!isClassTeacher) {
+      return res.status(403).json({ message: "Only the class teacher of this section can ask for this." });
+    }
+
+    if (date > today()) {
+      return res.status(400).json({ message: "You cannot ask for a future date." });
+    }
+
+    if (WEEKLY_HOLIDAY >= 0 && new Date(date + "T12:00:00").getDay() === WEEKLY_HOLIDAY) {
+      return res.status(400).json({ message: "The school is closed on that day." });
+    }
+
+    // Only a locked sheet needs a request.
+    const submitted = await queryOne(
+      "SELECT id FROM attendance WHERE class_id = $1 AND section_id = $2 AND date = $3 LIMIT 1",
+      [class_id, section_id, date]
+    );
+    const window = await getAttendanceWindow();
+    const locked = !!submitted || !isWithinWindow(window);
+    if (!locked) {
+      return res.status(400).json({ message: "Attendance is open right now, so you can mark it yourself." });
+    }
+
+    const teacher = await getTeacherOfUser(req.user.id);
+
+    const waiting = await queryOne(
+      `SELECT id FROM attendance_requests
+        WHERE teacher_id = $1 AND class_id = $2 AND section_id = $3 AND date = $4
+          AND status IN ('pending','approved')`,
+      [teacher.id, class_id, section_id, date]
+    );
+    if (waiting) {
+      return res.status(400).json({ message: "You already have a request open for this section and date." });
+    }
+
+    const rows = await query(
+      `INSERT INTO attendance_requests (teacher_id, class_id, section_id, date, reason)
+       VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+      [teacher.id, class_id, section_id, date, String(reason).trim()]
+    );
+
+    const detail = await queryOne(
+      `SELECT c.name AS class_name, sec.name AS section_name
+         FROM classes c, sections sec WHERE c.id = $1 AND sec.id = $2`,
+      [class_id, section_id]
+    );
+
+    const admins = await query("SELECT id FROM users WHERE role = 'admin' AND is_active = TRUE");
+    for (const a of admins) {
+      await notify(
+        a.id,
+        "Attendance reopen request from " + req.user.name,
+        req.user.name + " wants to change attendance for " + detail.class_name + " - Section " +
+          detail.section_name + " on " + new Date(date + "T12:00:00").toDateString() +
+          ". Reason: " + String(reason).trim(),
+        "attendance"
+      );
+    }
+
+    res.status(201).json({
+      message: "Request sent. The admin will decide, and you will be notified.",
+      request: rows[0],
+    });
+
+    logAudit(req.user, "requested", "attendance_reopen",
+      detail.class_name + " - Section " + detail.section_name + " on " + date, String(reason).trim());
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Could not send the request." });
+  }
+});
+
+// GET /api/attendance/requests   (admin sees all, a teacher sees their own)
+router.get("/requests", allow("admin", "teacher"), async function (req, res) {
+  try {
+    let teacherId = null;
+
+    if (req.user.role === "teacher") {
+      const teacher = await getTeacherOfUser(req.user.id);
+      if (!teacher) return res.json([]);
+      teacherId = teacher.id;
+    }
+
+    const rows = await query(
+      `SELECT ar.id, ar.reason, ar.status, ar.admin_note, ar.created_at, ar.decided_at,
+              TO_CHAR(ar.date, 'YYYY-MM-DD') AS date,
+              u.full_name AS teacher_name,
+              c.name AS class_name, sec.name AS section_name
+         FROM attendance_requests ar
+         JOIN teachers t   ON t.id = ar.teacher_id
+         JOIN users u      ON u.id = t.user_id
+         JOIN classes c    ON c.id = ar.class_id
+         JOIN sections sec ON sec.id = ar.section_id
+        WHERE ($1::int IS NULL OR ar.teacher_id = $1)
+        ORDER BY (ar.status = 'pending') DESC, ar.created_at DESC
+        LIMIT 100`,
+      [teacherId]
+    );
+
+    res.json(rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Could not load the requests." });
+  }
+});
+
+// POST /api/attendance/requests/:id/decide   (admin approves or refuses)
+router.post("/requests/:id/decide", allow("admin"), async function (req, res) {
+  try {
+    const approve = req.body.approve === true || req.body.approve === "true";
+    const note = req.body.admin_note || null;
+
+    const request = await queryOne(
+      `SELECT ar.*, TO_CHAR(ar.date, 'YYYY-MM-DD') AS date_text,
+              c.name AS class_name, sec.name AS section_name, t.user_id AS teacher_user_id
+         FROM attendance_requests ar
+         JOIN teachers t   ON t.id = ar.teacher_id
+         JOIN classes c    ON c.id = ar.class_id
+         JOIN sections sec ON sec.id = ar.section_id
+        WHERE ar.id = $1`,
+      [req.params.id]
+    );
+    if (!request) return res.status(404).json({ message: "Request not found." });
+    if (request.status !== "pending") {
+      return res.status(400).json({ message: "This request was already decided." });
+    }
+
+    await query(
+      `UPDATE attendance_requests
+          SET status = $1, admin_note = $2, decided_at = NOW()
+        WHERE id = $3`,
+      [approve ? "approved" : "rejected", note, request.id]
+    );
+
+    const nice = new Date(request.date_text + "T12:00:00").toDateString();
+
+    await notify(
+      request.teacher_user_id,
+      approve ? "Attendance reopened for one change" : "Attendance request refused",
+      approve
+        ? "You can now submit attendance for " + request.class_name + " - Section " + request.section_name +
+          " on " + nice + " once more. It locks again after you submit." + (note ? " Note: " + note : "")
+        : "The admin did not reopen attendance for " + request.class_name + " - Section " +
+          request.section_name + " on " + nice + "." + (note ? " Note: " + note : ""),
+      "attendance"
+    );
+
+    res.json({ message: approve ? "Request approved. The teacher can submit once." : "Request refused." });
+
+    logAudit(req.user, approve ? "approved" : "rejected", "attendance_reopen",
+      request.class_name + " - Section " + request.section_name + " on " + request.date_text, note);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Could not save the decision." });
   }
 });
 

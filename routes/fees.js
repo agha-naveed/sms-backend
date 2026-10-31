@@ -32,6 +32,9 @@ router.post("/generate", allow("admin"), async function (req, res) {
     const newStart = year * 12 + month;
     const newEnd = newStart + monthsCount - 1;
 
+    // Slips can be made for everyone, one class, or one specific student.
+    const studentId = req.body.student_id ? Number(req.body.student_id) : null;
+
     const students = await query(
       `SELECT s.id, s.admission_no, c.monthly_fee, pu.id AS parent_user_id, u.full_name AS name
          FROM students s
@@ -40,9 +43,14 @@ router.post("/generate", allow("admin"), async function (req, res) {
          LEFT JOIN parents p ON p.id = s.parent_id
          LEFT JOIN users pu  ON pu.id = p.user_id
         WHERE s.status = 'active'
-          AND ($1::int IS NULL OR s.class_id = $1)`,
-      [req.body.class_id || null]
+          AND ($1::int IS NULL OR s.class_id = $1)
+          AND ($2::int IS NULL OR s.id = $2)`,
+      [studentId ? null : req.body.class_id || null, studentId]
     );
+
+    if (studentId && students.length === 0) {
+      return res.status(404).json({ message: "That student was not found, or is not active." });
+    }
 
     const dueDate = year + "-" + String(month).padStart(2, "0") + "-" + String(dueDay).padStart(2, "0");
     const label = monthRangeLabel({ month: month, year: year, months_count: monthsCount });
@@ -104,7 +112,10 @@ router.post("/generate", allow("admin"), async function (req, res) {
       covers: label,
     });
 
-    logAudit(req.user, "generated", "fee_slip", label, created + " slips created, " + skipped + " skipped");
+    logAudit(
+      req.user, "generated", "fee_slip", label,
+      (studentId ? "For " + students[0].name + ": " : "") + created + " slips created, " + skipped + " skipped"
+    );
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: "Could not generate the fee slips." });

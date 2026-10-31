@@ -22,8 +22,8 @@ router.get("/", allow("admin", "teacher"), async function (req, res) {
     const { class_id, section_id, search } = req.query;
 
     let sql = `
-      SELECT s.id, s.admission_no, s.status, s.gender, s.class_id, s.section_id,
-             u.full_name AS name, u.email, u.phone,
+      SELECT s.id, s.user_id, s.admission_no, s.status, s.gender, s.class_id, s.section_id,
+             u.full_name AS name, u.email, u.phone, u.photo,
              c.name AS class_name, sec.name AS section_name,
              pu.full_name AS parent_name, pu.phone AS parent_phone
         FROM students s

@@ -6,9 +6,10 @@ const {
   checkPassword,
   makeToken,
   requireLogin,
+  allow,
 } = require("../auth");
 const {
-  cleanPhone, parentClash, emailOwner, staffEmail, phoneIdentity, phoneProblem, logAudit, notify,
+  cleanPhone, parentClash, emailOwner, staffEmail, phoneIdentity, phoneProblem, logAudit, notify, uploadImage,
 } = require("../helpers");
 
 const router = express.Router();
@@ -271,7 +272,7 @@ router.post("/password-request/complete", async function (req, res) {
 router.get("/me", requireLogin, async function (req, res) {
   try {
     const user = await queryOne(
-      "SELECT id, full_name, email, phone, role FROM users WHERE id = $1",
+      "SELECT id, full_name, email, phone, role, photo FROM users WHERE id = $1",
       [req.user.id]
     );
 
@@ -324,6 +325,60 @@ router.get("/me", requireLogin, async function (req, res) {
 // PUT /api/auth/profile
 // Anyone who is signed in can correct their own name, phone and email.
 // Staff addresses stay on @school.com.
+// Profile picture. Everyone sets their own; the admin can also set one for a
+// student (young children often do not sign in themselves).
+//   PUT    /api/auth/photo            own picture   (form field "photo")
+//   DELETE /api/auth/photo            remove own picture
+//   PUT    /api/auth/photo/:userId    admin sets someone's picture
+//   DELETE /api/auth/photo/:userId    admin removes it
+async function savePhoto(req, res, userId, photo) {
+  const target = await queryOne("SELECT id, full_name FROM users WHERE id = $1", [userId]);
+  if (!target) return res.status(404).json({ message: "Account not found." });
+
+  await query("UPDATE users SET photo = $1 WHERE id = $2", [photo, userId]);
+
+  logAudit(req.user, photo ? "updated" : "removed", "profile_picture", target.full_name);
+  res.json({ message: photo ? "Picture saved." : "Picture removed.", photo: photo });
+}
+
+router.put("/photo", requireLogin, uploadImage.single("photo"), async function (req, res) {
+  try {
+    if (!req.file) return res.status(400).json({ message: "Choose a picture first." });
+    await savePhoto(req, res, req.user.id, req.file.filename);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Could not save the picture." });
+  }
+});
+
+router.delete("/photo", requireLogin, async function (req, res) {
+  try {
+    await savePhoto(req, res, req.user.id, null);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Could not remove the picture." });
+  }
+});
+
+router.put("/photo/:userId", requireLogin, allow("admin"), uploadImage.single("photo"), async function (req, res) {
+  try {
+    if (!req.file) return res.status(400).json({ message: "Choose a picture first." });
+    await savePhoto(req, res, Number(req.params.userId), req.file.filename);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Could not save the picture." });
+  }
+});
+
+router.delete("/photo/:userId", requireLogin, allow("admin"), async function (req, res) {
+  try {
+    await savePhoto(req, res, Number(req.params.userId), null);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Could not remove the picture." });
+  }
+});
+
 router.put("/profile", requireLogin, async function (req, res) {
   try {
     const { full_name, phone, email } = req.body;

@@ -92,6 +92,64 @@ const upload = {
   },
 };
 
+// ---- profile pictures -------------------------------------------
+// Images only (JPG, PNG, WebP), up to 3 MB. Cloudinary crops the picture to
+// a 400 x 400 square (centred on the face when it can find one), so every
+// photo is small and the same shape.
+const photoMemory = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 3 * 1024 * 1024 },
+  fileFilter: function (req, file, done) {
+    const ext = path.extname(file.originalname).toLowerCase();
+    if ([".jpg", ".jpeg", ".png", ".webp"].includes(ext)) done(null, true);
+    else done(new Error("A profile picture must be a JPG, PNG or WebP image."));
+  },
+});
+
+function sendPhotoToCloudinary(file) {
+  return new Promise(function (resolve, reject) {
+    const stream = cloudinary.uploader.upload_stream(
+      {
+        folder: CLOUDINARY_FOLDER + "/profile",
+        resource_type: "image",
+        public_id: Date.now() + "-" + Math.round(Math.random() * 100000),
+        transformation: [{ width: 400, height: 400, crop: "fill", gravity: "auto", quality: "auto" }],
+      },
+      function (err, result) {
+        if (err) return reject(err);
+        resolve(result.secure_url);
+      }
+    );
+    stream.end(file.buffer);
+  });
+}
+
+// Same use as upload.single(...); req.file.filename becomes the picture's link.
+const uploadImage = {
+  single: function (field) {
+    const receive = photoMemory.single(field);
+
+    return function (req, res, next) {
+      receive(req, res, async function (err) {
+        if (err) return next(err);
+        if (!req.file) return next();
+
+        if (!process.env.CLOUDINARY_CLOUD_NAME || !process.env.CLOUDINARY_API_KEY || !process.env.CLOUDINARY_API_SECRET) {
+          return next(new Error("File storage is not set up. Add the Cloudinary keys to the server's .env file."));
+        }
+
+        try {
+          req.file.filename = await sendPhotoToCloudinary(req.file);
+          next();
+        } catch (e) {
+          console.error("Cloudinary photo upload failed:", e.message);
+          next(new Error("Could not upload the picture. Please try again."));
+        }
+      });
+    };
+  },
+};
+
 // ---- phone numbers and CNIC ------------------------------------
 // Stored in one shape so searching and printing are predictable:
 //   phone  +923001234567
@@ -539,7 +597,7 @@ function withTotals(slip) {
 }
 
 module.exports = {
-  upload, notify, calcLateFee, daysOverdue, withTotals, monthRangeLabel, MONTHS,
+  upload, uploadImage, notify, calcLateFee, daysOverdue, withTotals, monthRangeLabel, MONTHS,
   cleanPhone, cleanCnic,
   DEFAULT_PASSWORD, randomPassword, nextAdmissionNo, schoolEmail, parentSchoolEmail, parentClash,
   emailOwner, staffEmail, WEEKLY_HOLIDAY, DAY_NAMES, parentIdentity, phoneIdentity, phoneProblem,
