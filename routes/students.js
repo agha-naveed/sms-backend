@@ -42,12 +42,19 @@ router.get("/", allow("admin", "teacher"), async function (req, res) {
     // A teacher is limited to their own class + section list.
     if (req.user.role === "teacher") {
       sql += `
-         AND EXISTS (
-           SELECT 1 FROM teacher_classes tc
-             JOIN teachers t ON t.id = tc.teacher_id
-            WHERE t.user_id = $4
-              AND tc.class_id = s.class_id
-              AND tc.section_id = s.section_id
+         AND (
+           EXISTS (
+             SELECT 1 FROM teacher_classes tc
+               JOIN teachers t ON t.id = tc.teacher_id
+              WHERE t.user_id = $4
+                AND tc.class_id = s.class_id
+                AND tc.section_id = s.section_id
+           )
+           OR EXISTS (
+             SELECT 1 FROM sections sx
+               JOIN teachers t ON t.id = sx.class_teacher_id
+              WHERE t.user_id = $4 AND sx.id = s.section_id
+           )
          )`;
       values.push(req.user.id);
     }
@@ -337,6 +344,31 @@ router.put("/:id", allow("admin"), async function (req, res) {
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: "Could not save the student." });
+  }
+});
+
+// PUT /api/students/:id/reset-password  (admin)
+// Recovers a student's password. A student's login is a registration number
+// and a school-style address, so the office hands out a new temporary
+// password. It is shown once, to the admin.
+router.put("/:id/reset-password", allow("admin"), async function (req, res) {
+  try {
+    const student = await queryOne(
+      `SELECT s.*, u.full_name AS name, u.id AS user_id FROM students s
+         JOIN users u ON u.id = s.user_id WHERE s.id = $1`,
+      [req.params.id]
+    );
+    if (!student) return res.status(404).json({ message: "Student not found." });
+
+    const newPassword = randomPassword();
+    await query("UPDATE users SET password = $1 WHERE id = $2", [hashPassword(newPassword), student.user_id]);
+
+    res.json({ message: "Password reset.", password: newPassword });
+
+    logAudit(req.user, "reset", "password", student.name + " (" + student.admission_no + ")");
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Could not reset the password." });
   }
 });
 

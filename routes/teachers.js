@@ -16,13 +16,20 @@ router.get("/my-classes", allow("teacher"), async function (req, res) {
     const teacher = await getTeacherOfUser(req.user.id);
     if (!teacher) return res.json([]);
 
+    // Every section the teacher teaches in, plus the one they are class
+    // teacher of, each with the number of active students in it.
     const rows = await query(
-      `SELECT DISTINCT tc.class_id, tc.section_id,
-              c.name AS class_name, sec.name AS section_name
-         FROM teacher_classes tc
-         JOIN classes c    ON c.id = tc.class_id
-         JOIN sections sec ON sec.id = tc.section_id
-        WHERE tc.teacher_id = $1
+      `SELECT x.class_id, x.section_id, c.name AS class_name, sec.name AS section_name,
+              (SELECT COUNT(*)::int FROM students s
+                WHERE s.class_id = x.class_id AND s.section_id = x.section_id
+                  AND s.status = 'active') AS student_count
+         FROM (
+           SELECT class_id, section_id FROM teacher_classes WHERE teacher_id = $1
+           UNION
+           SELECT class_id, id AS section_id FROM sections WHERE class_teacher_id = $1
+         ) x
+         JOIN classes c    ON c.id = x.class_id
+         JOIN sections sec ON sec.id = x.section_id
         ORDER BY c.name, sec.name`,
       [teacher.id]
     );
@@ -359,6 +366,29 @@ router.delete("/classes/:linkId", allow("admin"), async function (req, res) {
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: "Could not remove the class." });
+  }
+});
+
+// PUT /api/teachers/:id/reset-password  (admin)
+// Recovers a teacher's password with a new temporary one, shown once to the
+// admin.
+router.put("/:id/reset-password", allow("admin"), async function (req, res) {
+  try {
+    const teacher = await queryOne(
+      "SELECT t.*, u.full_name AS name FROM teachers t JOIN users u ON u.id = t.user_id WHERE t.id = $1",
+      [req.params.id]
+    );
+    if (!teacher) return res.status(404).json({ message: "Teacher not found." });
+
+    const newPassword = randomPassword();
+    await query("UPDATE users SET password = $1 WHERE id = $2", [hashPassword(newPassword), teacher.user_id]);
+
+    res.json({ message: "Password reset.", password: newPassword });
+
+    logAudit(req.user, "reset", "password", teacher.name + " (teacher)");
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Could not reset the password." });
   }
 });
 

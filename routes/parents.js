@@ -108,4 +108,27 @@ router.post("/", async function (req, res) {
   }
 });
 
+// PUT /api/parents/:id/reset-password  (admin)
+// Recovers a parent's password with a new temporary one, shown once to the
+// admin. It does not change their children's own logins.
+router.put("/:id/reset-password", allow("admin"), async function (req, res) {
+  try {
+    const parent = await queryOne(
+      "SELECT p.*, u.full_name AS name FROM parents p JOIN users u ON u.id = p.user_id WHERE p.id = $1",
+      [req.params.id]
+    );
+    if (!parent) return res.status(404).json({ message: "Parent not found." });
+
+    const newPassword = randomPassword();
+    await query("UPDATE users SET password = $1 WHERE id = $2", [hashPassword(newPassword), parent.user_id]);
+
+    res.json({ message: "Password reset.", password: newPassword });
+
+    logAudit(req.user, "reset", "password", parent.name + " (parent)");
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Could not reset the password." });
+  }
+});
+
 module.exports = router;

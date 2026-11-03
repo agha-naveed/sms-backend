@@ -1,13 +1,37 @@
 const express = require("express");
 const { query, queryOne } = require("../db");
 const { requireLogin, getStudentOfUser, getTeacherOfUser, getParentOfUser } = require("../auth");
-const { withTotals } = require("../helpers");
+const { withTotals, MONTHS } = require("../helpers");
 
 const router = express.Router();
 router.use(requireLogin);
 
 function today() {
   return new Date().toISOString().slice(0, 10);
+}
+
+// Attendance for the last 14 days as one point per school day:
+// the share of marked students who were present.
+async function attendanceTrend(sectionPairs) {
+  const rows = await query(
+    `SELECT TO_CHAR(a.date, 'YYYY-MM-DD') AS date,
+            COUNT(*)::int AS marked,
+            COUNT(*) FILTER (WHERE a.status = 'present')::int AS present,
+            COUNT(*) FILTER (WHERE a.status = 'absent')::int  AS absent
+       FROM attendance a
+      WHERE a.date >= CURRENT_DATE - 13
+        AND ($1::text IS NULL OR (a.class_id || '-' || a.section_id) = ANY(string_to_array($1, ',')))
+      GROUP BY a.date
+      ORDER BY a.date`,
+    [sectionPairs]
+  );
+
+  return rows.map(function (r) {
+    return {
+      date: r.date, marked: r.marked, present: r.present, absent: r.absent,
+      percentage: r.marked === 0 ? 0 : Math.round((r.present / r.marked) * 100),
+    };
+  });
 }
 
 // GET /api/dashboard  -> different numbers depending on the role
@@ -51,12 +75,49 @@ router.get("/", async function (req, res) {
           ORDER BY a.created_at DESC LIMIT 5`
       );
 
+      // ---- numbers for the dashboard graphs ----
+      const studentsByClass = await query(
+        `SELECT c.name, COUNT(s.id)::int AS count
+           FROM classes c
+           LEFT JOIN students s ON s.class_id = c.id AND s.status = 'active'
+          GROUP BY c.id, c.name
+          ORDER BY c.id`
+      );
+
+      // Fees received in each of the last 6 months (months with nothing show 0).
+      const paid = await query(
+        `SELECT TO_CHAR(paid_on, 'YYYY-MM') AS ym, SUM(amount)::float AS total
+           FROM fee_payments
+          WHERE paid_on >= date_trunc('month', CURRENT_DATE) - INTERVAL '5 months'
+          GROUP BY 1`
+      );
+      const paidByMonth = {};
+      paid.forEach(function (p) { paidByMonth[p.ym] = p.total; });
+
+      const feesByMonth = [];
+      const now = new Date();
+      for (let i = 5; i >= 0; i--) {
+        const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+        const key = d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0");
+        feesByMonth.push({ label: MONTHS[d.getMonth()].slice(0, 3), value: paidByMonth[key] || 0 });
+      }
+
+      const admissionsByStatus = await query(
+        "SELECT status, COUNT(*)::int AS count FROM admissions GROUP BY status ORDER BY status"
+      );
+
       return res.json({
         role: role,
         counts: counts,
         attendance_today: attendance,
         fees: { collected: collected, pending: pending },
         recent_admissions: recentAdmissions,
+        charts: {
+          attendance_trend: await attendanceTrend(null),
+          students_by_class: studentsByClass,
+          fees_by_month: feesByMonth,
+          admissions_by_status: admissionsByStatus,
+        },
       });
     }
 
@@ -66,18 +127,21 @@ router.get("/", async function (req, res) {
       if (!teacher) return res.json({ role: role, classes: [], counts: {} });
 
       const classes = await query(
-        `SELECT DISTINCT tc.class_id, tc.section_id, c.name AS class_name, sec.name AS section_name,
+        `SELECT x.class_id, x.section_id, c.name AS class_name, sec.name AS section_name,
                 (SELECT COUNT(*)::int FROM students s
-                  WHERE s.class_id = tc.class_id AND s.section_id = tc.section_id
+                  WHERE s.class_id = x.class_id AND s.section_id = x.section_id
                     AND s.status = 'active') AS student_count,
                 EXISTS (SELECT 1 FROM attendance a
-                         WHERE a.class_id = tc.class_id AND a.section_id = tc.section_id
+                         WHERE a.class_id = x.class_id AND a.section_id = x.section_id
                            AND a.date = $2) AS attendance_done,
-                (sec.class_teacher_id = tc.teacher_id) AS is_class_teacher
-           FROM teacher_classes tc
-           JOIN classes c    ON c.id = tc.class_id
-           JOIN sections sec ON sec.id = tc.section_id
-          WHERE tc.teacher_id = $1
+                (sec.class_teacher_id = $1) AS is_class_teacher
+           FROM (
+             SELECT class_id, section_id FROM teacher_classes WHERE teacher_id = $1
+             UNION
+             SELECT class_id, id AS section_id FROM sections WHERE class_teacher_id = $1
+           ) x
+           JOIN classes c    ON c.id = x.class_id
+           JOIN sections sec ON sec.id = x.section_id
           ORDER BY c.name, sec.name`,
         [teacher.id, today()]
       );
@@ -95,6 +159,11 @@ router.get("/", async function (req, res) {
           students: classes.reduce(function (sum, c) { return sum + c.student_count; }, 0),
           assignments: assignments.total,
           pending_attendance: classes.filter(function (c) { return !c.attendance_done; }).length,
+        },
+        charts: {
+          attendance_trend: await attendanceTrend(
+            classes.length === 0 ? "none" : classes.map(function (c) { return c.class_id + "-" + c.section_id; }).join(",")
+          ),
         },
       });
     }

@@ -33,7 +33,6 @@ app.use("/api/settings", require("./routes/settings"));
 app.use("/api/audit", require("./routes/audit"));
 app.use("/api/teacher-attendance", require("./routes/teacherAttendance"));
 app.use("/api/timetable", require("./routes/timetable"));
-app.use("/api/password-requests", require("./routes/passwordRequests"));
 app.use("/api/files", require("./routes/files"));
 app.use("/api/student-import", require("./routes/studentImport"));
 
