@@ -232,8 +232,7 @@ router.put("/profile", requireLogin, async function (req, res) {
       const owner = await emailOwner(newEmail, me.id);
       if (owner) {
         return res.status(400).json({
-          message: "That email already belongs to " + owner.full_name +
-            " (" + owner.role + "). Every account needs its own.",
+          message: "This email is already taken",
         });
       }
     }
