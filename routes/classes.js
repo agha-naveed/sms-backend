@@ -1,5 +1,5 @@
 const express = require("express");
-const { query, queryOne } = require("../db");
+const { pool, query, queryOne } = require("../db");
 const { requireLogin, allow } = require("../auth");
 const { logAudit } = require("../helpers");
 
@@ -100,24 +100,47 @@ router.put("/:id", requireLogin, allow("admin"), async function (req, res) {
 });
 
 // DELETE /api/classes/:id
+// Only students who are still at the school block the delete. Students who
+// have left (status = 'inactive') are detached from the class, so their
+// record stays but they no longer point at a class that is going away.
 router.delete("/:id", requireLogin, allow("admin"), async function (req, res) {
+  const client = await pool.connect();
   try {
     const cls = await queryOne("SELECT name FROM classes WHERE id = $1", [req.params.id]);
-    const used = await queryOne("SELECT id FROM students WHERE class_id = $1 LIMIT 1", [
-      req.params.id,
-    ]);
-    if (used) {
-      return res
-        .status(400)
-        .json({ message: "This class has students in it. Move them first." });
+    if (!cls) {
+      client.release();
+      return res.status(404).json({ message: "Class not found." });
     }
-    await query("DELETE FROM classes WHERE id = $1", [req.params.id]);
-    res.json({ message: "Class deleted." });
 
-    logAudit(req.user, "deleted", "class", cls ? cls.name : "Class #" + req.params.id);
+    const active = await queryOne(
+      "SELECT COUNT(*)::int AS n FROM students WHERE class_id = $1 AND status <> 'inactive'",
+      [req.params.id]
+    );
+    if (active.n > 0) {
+      client.release();
+      return res.status(400).json({
+        message:
+          "This class still has " + active.n + " student" + (active.n === 1 ? "" : "s") +
+          " in it. Move them to another class, or mark them as \"Left the school\", first.",
+      });
+    }
+
+    await client.query("BEGIN");
+    await client.query(
+      "UPDATE students SET class_id = NULL, section_id = NULL WHERE class_id = $1",
+      [req.params.id]
+    );
+    await client.query("DELETE FROM classes WHERE id = $1", [req.params.id]);
+    await client.query("COMMIT");
+
+    res.json({ message: "Class deleted." });
+    logAudit(req.user, "deleted", "class", cls.name);
   } catch (err) {
+    await client.query("ROLLBACK").catch(function () {});
     console.error(err);
     res.status(500).json({ message: "Could not delete the class." });
+  } finally {
+    client.release();
   }
 });
 
@@ -208,26 +231,46 @@ router.put("/sections/:sectionId/class-teacher", requireLogin, allow("admin"), a
 });
 
 // DELETE /api/classes/sections/:sectionId
+// Same rule as classes: students who have left do not block the delete.
 router.delete("/sections/:sectionId", requireLogin, allow("admin"), async function (req, res) {
+  const client = await pool.connect();
   try {
     const section = await queryOne(
       `SELECT sec.name, c.name AS class_name FROM sections sec
          JOIN classes c ON c.id = sec.class_id WHERE sec.id = $1`,
       [req.params.sectionId]
     );
-    const used = await queryOne("SELECT id FROM students WHERE section_id = $1 LIMIT 1", [
-      req.params.sectionId,
-    ]);
-    if (used) {
-      return res.status(400).json({ message: "This section has students in it." });
+    if (!section) {
+      client.release();
+      return res.status(404).json({ message: "Section not found." });
     }
-    await query("DELETE FROM sections WHERE id = $1", [req.params.sectionId]);
-    res.json({ message: "Section deleted." });
 
-    if (section) logAudit(req.user, "deleted", "section", section.class_name + " - Section " + section.name);
+    const active = await queryOne(
+      "SELECT COUNT(*)::int AS n FROM students WHERE section_id = $1 AND status <> 'inactive'",
+      [req.params.sectionId]
+    );
+    if (active.n > 0) {
+      client.release();
+      return res.status(400).json({
+        message:
+          "This section still has " + active.n + " student" + (active.n === 1 ? "" : "s") +
+          " in it. Move them, or mark them as \"Left the school\", first.",
+      });
+    }
+
+    await client.query("BEGIN");
+    await client.query("UPDATE students SET section_id = NULL WHERE section_id = $1", [req.params.sectionId]);
+    await client.query("DELETE FROM sections WHERE id = $1", [req.params.sectionId]);
+    await client.query("COMMIT");
+
+    res.json({ message: "Section deleted." });
+    logAudit(req.user, "deleted", "section", section.class_name + " - Section " + section.name);
   } catch (err) {
+    await client.query("ROLLBACK").catch(function () {});
     console.error(err);
     res.status(500).json({ message: "Could not delete the section." });
+  } finally {
+    client.release();
   }
 });
 
