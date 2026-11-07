@@ -10,7 +10,7 @@ const {
   getStudentOfUser,
 } = require("../auth");
 const {
-  notify, MONTHS, WEEKLY_HOLIDAY, DAY_NAMES,
+  notify, MONTHS, getHolidayInfo, holidaysInRange,
   getAttendanceWindow, isWithinWindow, friendlyTime,
   resolveRange, todayText, asDateText, logAudit,
 } = require("../helpers");
@@ -76,8 +76,8 @@ router.get("/roster", allow("teacher", "admin"), async function (req, res) {
       [class_id, section_id, date]
     );
 
-    const isHoliday =
-      WEEKLY_HOLIDAY >= 0 && new Date(date + "T12:00:00").getDay() === WEEKLY_HOLIDAY;
+    const holiday = await getHolidayInfo(date);
+    const isHoliday = holiday.is_holiday;
 
     const window = await getAttendanceWindow();
 
@@ -90,7 +90,7 @@ router.get("/roster", allow("teacher", "admin"), async function (req, res) {
         request = await queryOne(
           `SELECT id, status, reason, admin_note FROM attendance_requests
             WHERE teacher_id = $1 AND class_id = $2 AND section_id = $3 AND date = $4
-              AND status IN ('pending','approved','rejected')
+              AND status IN ('pending','approved','rejected','used')
             ORDER BY created_at DESC LIMIT 1`,
           [teacher.id, class_id, section_id, date]
         );
@@ -101,7 +101,8 @@ router.get("/roster", allow("teacher", "admin"), async function (req, res) {
     res.json({
       date: date,
       is_holiday: isHoliday,
-      holiday_name: isHoliday ? DAY_NAMES[WEEKLY_HOLIDAY] : null,
+      holiday_name: holiday.name,
+      holiday_kind: holiday.kind,
       already_marked: students.some(function (s) { return s.attendance_id !== null; }),
       students: students,
       attendance_window: window,
@@ -157,10 +158,11 @@ router.post("/mark", allow("teacher", "admin"), async function (req, res) {
     }
 
     // The school is closed on the weekly holiday, so no attendance that day.
-    if (WEEKLY_HOLIDAY >= 0 && new Date(date + "T12:00:00").getDay() === WEEKLY_HOLIDAY) {
+    const closed = await getHolidayInfo(date);
+    if (closed.is_holiday) {
       return res.status(400).json({
-        message: "The school is closed on " + DAY_NAMES[WEEKLY_HOLIDAY] +
-          ", so attendance cannot be marked for that date.",
+        message: "The school is closed on " + new Date(date + "T12:00:00").toDateString() +
+          " (" + closed.name + "), so attendance cannot be marked for that date.",
       });
     }
 
@@ -303,8 +305,9 @@ router.post("/requests", allow("teacher"), async function (req, res) {
       return res.status(400).json({ message: "You cannot ask for a future date." });
     }
 
-    if (WEEKLY_HOLIDAY >= 0 && new Date(date + "T12:00:00").getDay() === WEEKLY_HOLIDAY) {
-      return res.status(400).json({ message: "The school is closed on that day." });
+    const closedDay = await getHolidayInfo(date);
+    if (closedDay.is_holiday) {
+      return res.status(400).json({ message: "The school is closed on that day (" + closedDay.name + ")." });
     }
 
     // Only a locked sheet needs a request.
@@ -481,6 +484,7 @@ router.get("/student/:id", async function (req, res) {
         WHERE student_id = $1
           AND EXTRACT(MONTH FROM date) = $2
           AND EXTRACT(YEAR FROM date) = $3
+          AND NOT is_school_holiday(date)
         ORDER BY date DESC`,
       [id, month, year]
     );
@@ -565,7 +569,8 @@ router.get("/report", async function (req, res) {
          LEFT JOIN sections sec ON sec.id = s.section_id
          LEFT JOIN attendance a
                 ON a.student_id = s.id AND a.date BETWEEN $1 AND $2
-        WHERE s.status = 'active'
+               AND NOT is_school_holiday(a.date)
+        WHERE (s.status = 'active' OR $5::int IS NOT NULL)
           AND ($3::int IS NULL OR s.class_id = $3)
           AND ($4::int IS NULL OR s.section_id = $4)
           AND ($5::int IS NULL OR s.id = $5)
@@ -591,6 +596,7 @@ router.get("/report", async function (req, res) {
          FROM attendance a
          JOIN students s ON s.id = a.student_id
         WHERE a.date BETWEEN $1 AND $2
+          AND NOT is_school_holiday(a.date)
           AND ($3::int IS NULL OR s.class_id = $3)
           AND ($4::int IS NULL OR s.section_id = $4)
           AND ($5::int IS NULL OR s.id = $5)
@@ -615,6 +621,7 @@ router.get("/report", async function (req, res) {
            LEFT JOIN sections sec ON sec.id = s.section_id
            LEFT JOIN attendance a
                   ON a.student_id = s.id AND a.date BETWEEN $1 AND $2
+                 AND NOT is_school_holiday(a.date)
           WHERE s.status = 'active'
             AND ($3::int IS NULL OR s.class_id = $3)
             AND ($4::int IS NULL OR s.section_id = $4)
@@ -657,6 +664,7 @@ router.get("/report", async function (req, res) {
         on_leave: onLeave,
         percentage: marked === 0 ? 0 : Math.round((present / marked) * 100),
       },
+      holidays: await holidaysInRange(range.from, range.to),
       by_day: byDay,
       by_student: students,
       by_section: bySection,
@@ -682,7 +690,7 @@ router.get("/daily", allow("admin"), async function (req, res) {
          FROM attendance a
          JOIN classes c    ON c.id = a.class_id
          JOIN sections sec ON sec.id = a.section_id
-        WHERE a.date = $1
+        WHERE a.date = $1 AND NOT is_school_holiday(a.date)
         GROUP BY c.name, sec.name
         ORDER BY c.name, sec.name`,
       [date]

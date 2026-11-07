@@ -7,7 +7,7 @@
 const express = require("express");
 const { query, queryOne } = require("../db");
 const { requireLogin, allow, getTeacherOfUser } = require("../auth");
-const { notify, WEEKLY_HOLIDAY, DAY_NAMES, resolveRange, todayText, logAudit } = require("../helpers");
+const { notify, getHolidayInfo, resolveRange, todayText, logAudit } = require("../helpers");
 
 const router = express.Router();
 router.use(requireLogin);
@@ -26,12 +26,13 @@ router.get("/roster", allow("admin"), async function (req, res) {
       [date]
     );
 
-    const isHoliday = WEEKLY_HOLIDAY >= 0 && new Date(date + "T12:00:00").getDay() === WEEKLY_HOLIDAY;
+    const holiday = await getHolidayInfo(date);
+    const isHoliday = holiday.is_holiday;
 
     res.json({
       date: date,
       is_holiday: isHoliday,
-      holiday_name: isHoliday ? DAY_NAMES[WEEKLY_HOLIDAY] : null,
+      holiday_name: holiday.name,
       already_marked: teachers.some(function (t) { return t.attendance_id !== null; }),
       teachers: teachers,
     });

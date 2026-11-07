@@ -30,6 +30,7 @@ app.use("/api/notices", require("./routes/notices"));
 app.use("/api/notifications", require("./routes/notifications"));
 app.use("/api/dashboard", require("./routes/dashboard"));
 app.use("/api/settings", require("./routes/settings"));
+app.use("/api/holidays", require("./routes/holidays"));
 app.use("/api/audit", require("./routes/audit"));
 app.use("/api/teacher-attendance", require("./routes/teacherAttendance"));
 app.use("/api/timetable", require("./routes/timetable"));
@@ -58,6 +59,12 @@ const PORT = process.env.PORT || 5000;
 
 pool
   .query("SELECT 1")
+  .then(function () {
+    return require("./migrate")().catch(function (err) {
+      console.error("Could not set up the holiday tables: " + err.message);
+      console.error("Holidays will not work until this is fixed.");
+    });
+  })
   .then(function () {
     app.listen(PORT, function () {
       console.log("Database connected.");

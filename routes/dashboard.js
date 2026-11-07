@@ -1,7 +1,7 @@
 const express = require("express");
 const { query, queryOne } = require("../db");
 const { requireLogin, getStudentOfUser, getTeacherOfUser, getParentOfUser } = require("../auth");
-const { withTotals, MONTHS } = require("../helpers");
+const { withTotals, MONTHS, getHolidayInfo } = require("../helpers");
 
 const router = express.Router();
 router.use(requireLogin);
@@ -20,6 +20,7 @@ async function attendanceTrend(sectionPairs) {
             COUNT(*) FILTER (WHERE a.status = 'absent')::int  AS absent
        FROM attendance a
       WHERE a.date >= CURRENT_DATE - 13
+        AND NOT is_school_holiday(a.date)
         AND ($1::text IS NULL OR (a.class_id || '-' || a.section_id) = ANY(string_to_array($1, ',')))
       GROUP BY a.date
       ORDER BY a.date`,
@@ -55,7 +56,7 @@ router.get("/", async function (req, res) {
            COUNT(*)::int AS marked,
            COUNT(*) FILTER (WHERE status = 'present')::int AS present,
            COUNT(*) FILTER (WHERE status = 'absent')::int  AS absent
-         FROM attendance WHERE date = $1`,
+         FROM attendance WHERE date = $1 AND NOT is_school_holiday(date)`,
         [today()]
       );
 
@@ -179,7 +180,7 @@ router.get("/", async function (req, res) {
         `SELECT COUNT(*)::int AS total,
                 COUNT(*) FILTER (WHERE status = 'present')::int AS present
            FROM attendance
-          WHERE student_id = $1
+          WHERE student_id = $1 AND NOT is_school_holiday(date)
             AND EXTRACT(MONTH FROM date) = $2 AND EXTRACT(YEAR FROM date) = $3`,
         [me.id, now.getMonth() + 1, now.getFullYear()]
       );
@@ -221,26 +222,32 @@ router.get("/", async function (req, res) {
       if (!parent) return res.json({ role: role, children: [] });
 
       const children = await query(
-        `SELECT s.id, u.full_name AS name, s.admission_no,
+        `SELECT s.id, u.full_name AS name, s.admission_no, s.status,
                 c.name AS class_name, sec.name AS section_name
            FROM students s
            JOIN users u ON u.id = s.user_id
            LEFT JOIN classes c    ON c.id = s.class_id
            LEFT JOIN sections sec ON sec.id = s.section_id
           WHERE s.parent_id = $1
-          ORDER BY u.full_name`,
+          ORDER BY (s.status = 'active') DESC, u.full_name`,
         [parent.id]
       );
 
       const now = new Date();
+      const holidayToday = await getHolidayInfo(today());
 
       for (const child of children) {
+        // A child who has left stays on the list, marked as left. There is
+        // no attendance or fee summary to show for them.
+        child.left = child.status !== "active";
+        if (child.left) continue;
+
         const att = await queryOne(
           `SELECT COUNT(*)::int AS total,
                   COUNT(*) FILTER (WHERE status = 'present')::int AS present,
                   COUNT(*) FILTER (WHERE status = 'absent')::int  AS absent
              FROM attendance
-            WHERE student_id = $1
+            WHERE student_id = $1 AND NOT is_school_holiday(date)
               AND EXTRACT(MONTH FROM date) = $2 AND EXTRACT(YEAR FROM date) = $3`,
           [child.id, now.getMonth() + 1, now.getFullYear()]
         );
@@ -262,7 +269,9 @@ router.get("/", async function (req, res) {
           "SELECT status FROM attendance WHERE student_id = $1 AND date = $2",
           [child.id, today()]
         );
-        child.today_status = todayRow ? todayRow.status : "not marked";
+        // Nothing marked (or the school is closed) means nothing to show.
+        child.today_status = !holidayToday.is_holiday && todayRow ? todayRow.status : null;
+        child.today_holiday = holidayToday.is_holiday ? holidayToday.name : null;
       }
 
       const unread = await queryOne(
@@ -270,7 +279,9 @@ router.get("/", async function (req, res) {
         [req.user.id]
       );
 
-      return res.json({ role: role, children: children, unread: unread.unread });
+      const allLeft = children.length > 0 && children.every(function (c) { return c.left; });
+
+      return res.json({ role: role, children: children, unread: unread.unread, all_left: allLeft });
     }
 
     res.json({ role: role });

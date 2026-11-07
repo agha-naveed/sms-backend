@@ -36,10 +36,34 @@ function requireLogin(req, res, next) {
 
   try {
     req.user = jwt.verify(token, SECRET);
-    next();
   } catch (err) {
     return res.status(401).json({ message: "Your session expired. Log in again." });
   }
+
+  // A parent whose children have all left the school can only open the
+  // dashboard (and their own profile check). Everything else is closed.
+  if (req.user.role !== "parent") return next();
+
+  const url = req.originalUrl.split("?")[0].replace(/\/+$/, "");
+  const allowed = req.method === "GET" && (url === "/api/auth/me" || url === "/api/dashboard");
+  if (allowed) return next();
+
+  queryOne(
+    `SELECT COUNT(*)::int AS total,
+            COUNT(*) FILTER (WHERE s.status = 'active')::int AS active
+       FROM students s JOIN parents p ON p.id = s.parent_id
+      WHERE p.user_id = $1`,
+    [req.user.id]
+  )
+    .then(function (row) {
+      if (row && row.total > 0 && row.active === 0) {
+        return res.status(403).json({
+          message: "Your children have left the school, so this account can only view the dashboard.",
+        });
+      }
+      next();
+    })
+    .catch(function () { next(); });
 }
 
 // Use like:  router.get("/", requireLogin, allow("admin"), handler)

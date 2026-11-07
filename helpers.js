@@ -2,7 +2,7 @@
 require("dotenv").config();
 const path = require("path");
 const multer = require("multer");
-const { query } = require("./db");
+const { query, queryOne } = require("./db");
 
 // ---- file uploads ----------------------------------------------
 // Files are kept in memory just long enough to be sent to Cloudinary, then
@@ -282,6 +282,78 @@ function staffEmail(input) {
 const WEEKLY_HOLIDAY = Number(
   process.env.WEEKLY_HOLIDAY === undefined ? 0 : process.env.WEEKLY_HOLIDAY
 );
+
+const HOLIDAY_KINDS = {
+  holiday: "Holiday",
+  summer_vacation: "Summer vacation",
+  winter_vacation: "Winter vacation",
+  local_holiday: "Local holiday",
+};
+
+const WEEKLY_OFF_DAYS = { none: [], sunday: [0], saturday: [6], both: [0, 6] };
+
+// "none" | "sunday" | "saturday" | "both". The admin sets it on the Holidays
+// page. Until then it follows the old WEEKLY_HOLIDAY setting (Sunday).
+async function getWeeklyOff() {
+  try {
+    const row = await queryOne("SELECT weekly_off FROM school_settings ORDER BY id LIMIT 1");
+    if (row && WEEKLY_OFF_DAYS[row.weekly_off]) return row.weekly_off;
+  } catch (err) { /* column not created yet */ }
+  return "sunday";
+}
+
+// Is the school closed on this date (YYYY-MM-DD)? Returns
+// { is_holiday, name, kind } so callers can show the reason.
+async function getHolidayInfo(dateText) {
+  const day = new Date(dateText + "T12:00:00").getDay();
+
+  try {
+    const range = await queryOne(
+      `SELECT kind, title FROM school_holidays
+        WHERE $1::date BETWEEN start_date AND end_date
+        ORDER BY start_date DESC LIMIT 1`,
+      [dateText]
+    );
+    if (range) return { is_holiday: true, name: range.title, kind: range.kind };
+  } catch (err) { /* table not created yet */ }
+
+  const weeklyOff = await getWeeklyOff();
+  if (WEEKLY_OFF_DAYS[weeklyOff].includes(day)) {
+    return { is_holiday: true, name: DAY_NAMES[day], kind: "weekly_off" };
+  }
+  return { is_holiday: false, name: null, kind: null };
+}
+
+// Every closed day between two dates, for showing on reports.
+async function holidaysInRange(from, to) {
+  const out = [];
+  let ranges = [];
+  try {
+    ranges = await queryOne(
+      `SELECT COALESCE(json_agg(json_build_object(
+                'kind', kind, 'title', title,
+                'start', TO_CHAR(start_date, 'YYYY-MM-DD'), 'end', TO_CHAR(end_date, 'YYYY-MM-DD'))), '[]') AS r
+         FROM school_holidays WHERE start_date <= $2::date AND end_date >= $1::date`,
+      [from, to]
+    );
+    ranges = ranges.r;
+  } catch (err) { ranges = []; }
+
+  const weekly = WEEKLY_OFF_DAYS[await getWeeklyOff()];
+  const cursor = new Date(from + "T12:00:00");
+  const last = new Date(to + "T12:00:00");
+  let guard = 0;
+
+  while (cursor <= last && guard < 400) {
+    const text = cursor.toISOString().slice(0, 10);
+    const hit = ranges.find(function (r) { return text >= r.start && text <= r.end; });
+    if (hit) out.push({ date: text, name: hit.title, kind: hit.kind });
+    else if (weekly.includes(cursor.getDay())) out.push({ date: text, name: DAY_NAMES[cursor.getDay()], kind: "weekly_off" });
+    cursor.setDate(cursor.getDate() + 1);
+    guard++;
+  }
+  return out;
+}
 
 const DAY_NAMES = [
   "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday",
@@ -600,7 +672,7 @@ module.exports = {
   upload, uploadImage, notify, calcLateFee, daysOverdue, withTotals, monthRangeLabel, MONTHS,
   cleanPhone, cleanCnic,
   DEFAULT_PASSWORD, randomPassword, nextAdmissionNo, schoolEmail, parentSchoolEmail, parentClash,
-  emailOwner, staffEmail, WEEKLY_HOLIDAY, DAY_NAMES, parentIdentity, phoneIdentity, phoneProblem,
+  emailOwner, staffEmail, WEEKLY_HOLIDAY, DAY_NAMES, HOLIDAY_KINDS, WEEKLY_OFF_DAYS, getWeeklyOff, getHolidayInfo, holidaysInRange, parentIdentity, phoneIdentity, phoneProblem,
   getAttendanceWindow, isWithinWindow, friendlyTime, logAudit,
   resolveRange, todayText, asDateText,
 };

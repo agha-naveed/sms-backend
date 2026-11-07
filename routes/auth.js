@@ -105,7 +105,7 @@ router.get("/me", requireLogin, async function (req, res) {
       out.parent = parent;
       out.children = parent
         ? await query(
-            `SELECT s.id, u.full_name AS name, s.admission_no,
+            `SELECT s.id, u.full_name AS name, s.admission_no, s.status,
                     s.class_id, s.section_id,
                     c.name AS class_name, sec.name AS section_name
                FROM students s
@@ -113,10 +113,14 @@ router.get("/me", requireLogin, async function (req, res) {
                LEFT JOIN classes c    ON c.id = s.class_id
                LEFT JOIN sections sec ON sec.id = s.section_id
               WHERE s.parent_id = $1
-              ORDER BY u.full_name`,
+              ORDER BY (s.status = 'active') DESC, u.full_name`,
             [parent.id]
           )
         : [];
+      // Every child has left: the account is limited to the dashboard.
+      out.parent_blocked =
+        out.children.length > 0 &&
+        out.children.every(function (c) { return c.status !== "active"; });
     }
 
     if (user.role === "teacher") {
