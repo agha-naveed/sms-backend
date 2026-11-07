@@ -160,27 +160,37 @@ router.get("/", allow("admin"), async function (req, res) {
         ORDER BY u.full_name`
     );
 
-    // attach the class list and the class-teacher section (if any) of each teacher
-    for (const t of rows) {
-      t.classes = await query(
-        `SELECT tc.id, c.name AS class_name, sec.name AS section_name, sub.name AS subject_name
-           FROM teacher_classes tc
-           JOIN classes c    ON c.id = tc.class_id
-           JOIN sections sec ON sec.id = tc.section_id
-           LEFT JOIN subjects sub ON sub.id = tc.subject_id
-          WHERE tc.teacher_id = $1
-          ORDER BY c.name, sec.name`,
-        [t.id]
-      );
+    // Attach each teacher's classes and class-teacher section. Two queries for
+    // ALL teachers together (not two per teacher), so the page opens fast
+    // however many teachers there are.
+    const ids = rows.map(function (t) { return t.id; });
+    const links = ids.length === 0 ? [] : await query(
+      `SELECT tc.id, tc.teacher_id, c.name AS class_name, sec.name AS section_name, sub.name AS subject_name
+         FROM teacher_classes tc
+         JOIN classes c    ON c.id = tc.class_id
+         JOIN sections sec ON sec.id = tc.section_id
+         LEFT JOIN subjects sub ON sub.id = tc.subject_id
+        WHERE tc.teacher_id = ANY($1::int[])
+        ORDER BY c.name, sec.name`,
+      [ids]
+    );
+    const owned = ids.length === 0 ? [] : await query(
+      `SELECT sec.class_teacher_id AS teacher_id, c.name AS class_name, sec.name AS section_name
+         FROM sections sec
+         JOIN classes c ON c.id = sec.class_id
+        WHERE sec.class_teacher_id = ANY($1::int[])`,
+      [ids]
+    );
 
-      t.class_teacher_of = await queryOne(
-        `SELECT c.name AS class_name, sec.name AS section_name
-           FROM sections sec
-           JOIN classes c ON c.id = sec.class_id
-          WHERE sec.class_teacher_id = $1`,
-        [t.id]
-      );
-    }
+    const classesOf = {};
+    const ownerOf = {};
+    links.forEach(function (l) { (classesOf[l.teacher_id] = classesOf[l.teacher_id] || []).push(l); });
+    owned.forEach(function (o) { if (!ownerOf[o.teacher_id]) ownerOf[o.teacher_id] = o; });
+
+    rows.forEach(function (t) {
+      t.classes = classesOf[t.id] || [];
+      t.class_teacher_of = ownerOf[t.id] || null;
+    });
 
     res.json(rows);
   } catch (err) {

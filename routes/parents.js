@@ -19,20 +19,22 @@ router.get("/", async function (req, res) {
          JOIN users u ON u.id = p.user_id
         ORDER BY u.full_name`
     );
-    // attach each parent's children so the admin can see the family together
-    for (const parent of rows) {
-      parent.students = await query(
-        `SELECT s.id, s.admission_no, u.full_name AS name, u.email,
-                c.name AS class_name, sec.name AS section_name
-           FROM students s
-           JOIN users u ON u.id = s.user_id
-           LEFT JOIN classes c    ON c.id = s.class_id
-           LEFT JOIN sections sec ON sec.id = s.section_id
-          WHERE s.parent_id = $1
-          ORDER BY u.full_name`,
-        [parent.id]
-      );
-    }
+    // attach each parent's children with ONE query for all parents
+    const ids = rows.map(function (p) { return p.id; });
+    const kids = ids.length === 0 ? [] : await query(
+      `SELECT s.id, s.parent_id, s.admission_no, s.status, u.full_name AS name, u.email,
+              c.name AS class_name, sec.name AS section_name
+         FROM students s
+         JOIN users u ON u.id = s.user_id
+         LEFT JOIN classes c    ON c.id = s.class_id
+         LEFT JOIN sections sec ON sec.id = s.section_id
+        WHERE s.parent_id = ANY($1::int[])
+        ORDER BY u.full_name`,
+      [ids]
+    );
+    const byParent = {};
+    kids.forEach(function (k) { (byParent[k.parent_id] = byParent[k.parent_id] || []).push(k); });
+    rows.forEach(function (p) { p.students = byParent[p.id] || []; });
 
     res.json(rows);
   } catch (err) {
