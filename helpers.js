@@ -459,8 +459,28 @@ function phoneProblem(result, phone) {
 // ---- date ranges for attendance-style reports ---------------------
 // period is "day", "week" or "month". Anything else means the caller sent
 // their own from and to dates. Shared by student and teacher attendance.
+const SCHOOL_TIMEZONE = process.env.SCHOOL_TIMEZONE || "Asia/Karachi";
+
+function schoolClock() {
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: SCHOOL_TIMEZONE,
+    hourCycle: "h23",
+    year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit",
+  }).formatToParts(new Date());
+
+  const get = function (type) {
+    return parts.find(function (p) { return p.type === type; }).value;
+  };
+
+  return {
+    date: get("year") + "-" + get("month") + "-" + get("day"),
+    minutes: Number(get("hour")) * 60 + Number(get("minute")),
+  };
+}
+
 function todayText() {
-  return new Date().toISOString().slice(0, 10);
+  return schoolClock().date;
 }
 
 function asDateText(value) {
@@ -529,8 +549,7 @@ function minutesOf(hhmm) {
 // Is right now inside the attendance window? Used to decide whether a
 // teacher may submit attendance at this moment.
 function isWithinWindow(window) {
-  const now = new Date();
-  const nowMinutes = now.getHours() * 60 + now.getMinutes();
+  const nowMinutes = schoolClock().minutes;
   return nowMinutes >= minutesOf(window.start) && nowMinutes <= minutesOf(window.end);
 }
 
